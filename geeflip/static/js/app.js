@@ -101,9 +101,6 @@ function setStatus(snapshot) {
   document.getElementById("stat-run-winners").textContent = (
     snapshot.winners_run ?? 0
   ).toLocaleString();
-  const cookiePill = document.getElementById("cookie-pill");
-  cookiePill.textContent = snapshot.cookies ? "cookies loaded" : "no cookies";
-  cookiePill.classList.toggle("missing", !snapshot.cookies);
 }
 
 function renderWinners(payload) {

@@ -1,4 +1,3 @@
-import base64
 import os
 import re
 import subprocess
@@ -105,7 +104,6 @@ DEFAULT_SHIP_ZIP = "73072"
 DEFAULT_SHIP_COUNTRY = "USA"
 DEFAULT_SHIP_LATITUDE = 35.2226
 DEFAULT_SHIP_LONGITUDE = -97.4395
-_ZIP_COUNTRY_RE = re.compile(r"^\d{3,10},[A-Z]{2,3}$")
 MIN_RESULTS_PAGE_BYTES = 10_000
 BODY_PREVIEW_CHARS = 500
 HTML_DEBUG_CHARS = 12_000
@@ -146,10 +144,6 @@ RELATIVE_LISTING_DATE_RE = re.compile(
 DATE_PARSE_FORMATS = ("%b-%d %H:%M", "%b-%d", "%b %d %H:%M", "%b %d")
 SHIPPING_FREE_MARKERS = ("free delivery", "free shipping")
 US_LOCATION_MARKER = "united states"
-
-EBAY_COOKIE_URL = "https://www.ebay.com/"
-EBAY_LOCATION_COOKIE_NAMES = frozenset({"nonsession", "dp1", "ns1", "ebay", "zip"})
-EBAY_SESSION_COOKIE_NAMES = frozenset({"s", "ds2", "nonsession", "ebay", "dp1", "ns1"})
 
 
 @dataclass
@@ -1286,154 +1280,9 @@ def fetch_amazon_sales_rank(page: Page, url: str) -> int | None:
     return extract_amazon_sales_rank(page.content())
 
 
-def _cookie_entry(name: str, value: str) -> dict:
-    return {
-        "name": name,
-        "value": value,
-        "url": EBAY_COOKIE_URL,
-        "secure": True,
-        "sameSite": "Lax",
-    }
-
-
-def _zip_country_blob(zip_code: str, country: str) -> str:
-    return (
-        base64.b64encode(f"{zip_code},{country}".encode("ascii"))
-        .decode("ascii")
-        .rstrip("=")
-    )
-
-
-def replace_nonsession_zip(
-    nonsession: str,
-    zip_code: str = DEFAULT_SHIP_ZIP,
-    country: str = DEFAULT_SHIP_COUNTRY,
-) -> str:
-    new_blob = _zip_country_blob(zip_code, country)
-    if new_blob in nonsession:
-        return nonsession
-    target = f"{zip_code},{country}"
-    for start in range(0, len(nonsession) - 12 + 1):
-        blob = nonsession[start : start + 12]
-        try:
-            decoded = base64.b64decode(blob).decode("ascii")
-        except Exception:
-            continue
-        if not _ZIP_COUNTRY_RE.fullmatch(decoded):
-            continue
-        if decoded == target:
-            return nonsession
-        return nonsession[:start] + new_blob + nonsession[start + 12 :]
-    return nonsession
-
-
-def strip_dp1_identity(value: str) -> str:
-    """Drop personal identity fields so a datacenter IP is not tied to a login."""
-    parts = []
-    for part in (value or "").split("^"):
-        if not part:
-            continue
-        lowered = part.casefold()
-        if lowered.startswith("bu1p/") or lowered.startswith("u1f/"):
-            continue
-        parts.append(part)
-    result = "^".join(parts)
-    if value.endswith("^") and result:
-        result += "^"
-    return result
-
-
-def rewrite_dp1_for_us(value: str) -> str:
-    value = strip_dp1_identity(value)
-    return re.sub(r"(^|\^)bl/[A-Za-z]{2}", r"\1bl/US", value)
-
-
-def parse_cookie_header(cookie_header: str) -> list[dict]:
-    # Last value wins when the header repeats a name (e.g. ds2).
-    by_name: dict[str, dict] = {}
-    for part in cookie_header.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-
-        name, _, value = part.partition("=")
-        name = name.strip()
-        value = value.strip()
-        if not name:
-            continue
-
-        lowered = name.casefold()
-        if lowered == "dp1":
-            value = rewrite_dp1_for_us(value)
-        elif lowered == "nonsession":
-            value = replace_nonsession_zip(value)
-        elif lowered == "zip":
-            value = DEFAULT_SHIP_ZIP
-        by_name[lowered] = _cookie_entry(name, value)
-
-    if by_name and "zip" not in by_name:
-        by_name["zip"] = _cookie_entry("zip", DEFAULT_SHIP_ZIP)
-
-    return [
-        cookie
-        for name, cookie in by_name.items()
-        if name in EBAY_LOCATION_COOKIE_NAMES
-    ]
-
-
-def load_ebay_cookies(
-    *,
-    cookie_header: str | None = None,
-    cookies_file: Path | None = None,
-    default_cookies_file: Path | None = None,
-) -> list[dict]:
-    header = (cookie_header or "").strip()
-
-    if not header and cookies_file is not None and cookies_file.exists():
-        header = cookies_file.read_text(encoding="utf-8").strip()
-
-    if not header:
-        header = os.environ.get("EBAY_COOKIES", "").strip()
-
-    if not header and default_cookies_file is not None and default_cookies_file.exists():
-        header = default_cookies_file.read_text(encoding="utf-8").strip()
-
-    if not header:
-        return []
-
-    cookies = parse_cookie_header(header)
-    if cookies:
-        print(
-            f"Forcing ship-to {DEFAULT_SHIP_ZIP} {DEFAULT_SHIP_COUNTRY} "
-            "in location cookies",
-            flush=True,
-        )
-    return cookies
-
-
-def describe_ebay_cookie_session(cookies: list[dict]) -> str:
-    if not cookies:
-        return "guest (no cookies)"
-
-    names = {cookie["name"] for cookie in cookies}
-    location_names = sorted(names & EBAY_LOCATION_COOKIE_NAMES)
-    if location_names and not (names - EBAY_LOCATION_COOKIE_NAMES):
-        return f"US location ({len(cookies)} cookies: {', '.join(location_names)})"
-    session_names = sorted(names & EBAY_SESSION_COOKIE_NAMES)
-    if session_names:
-        return f"account session ({len(cookies)} cookies, session: {', '.join(session_names)})"
-    return f"custom cookies ({len(cookies)} cookies)"
-
-
-def apply_cookies_to_context(context, cookies: list[dict]) -> None:
-    if cookies:
-        context.add_cookies(cookies)
-
-
 def create_browser_context(
     browser: Browser,
     *,
-    cookies: list[dict] | None = None,
     headless: bool = False,
 ):
     viewport = (
@@ -1452,7 +1301,6 @@ def create_browser_context(
         viewport=viewport,
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
-    apply_cookies_to_context(context, cookies or [])
     return context
 
 
@@ -1690,7 +1538,7 @@ def _launch_chromium(playwright, *, headless: bool):
     return playwright.chromium.launch(headless=False, **kwargs)
 
 
-def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
+def launch_ebay_browser(playwright, *, headless: bool = False):
     last_error = None
     for attempt in range(1, BROWSER_WARMUP_ATTEMPTS + 1):
         browser = None
@@ -1699,7 +1547,6 @@ def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = Fal
             browser = _launch_chromium(playwright, headless=headless)
             context = create_browser_context(
                 browser,
-                cookies=cookies,
                 headless=headless,
             )
             page = context.new_page()
@@ -1733,9 +1580,8 @@ def close_ebay_browser(browser, context) -> None:
 
 
 class EbayBrowserSession:
-    def __init__(self, playwright, cookies: list[dict], *, headless: bool = False):
+    def __init__(self, playwright, *, headless: bool = False):
         self._playwright = playwright
-        self._cookies = cookies
         self._headless = headless
         self.browser = None
         self.context = None
@@ -1745,7 +1591,6 @@ class EbayBrowserSession:
     def start(self) -> None:
         self.browser, self.context, self.page = launch_ebay_browser(
             self._playwright,
-            self._cookies,
             headless=self._headless,
         )
 
@@ -1764,22 +1609,11 @@ class EbayBrowserSession:
 @contextmanager
 def browser_session(
     *,
-    cookies: list[dict] | None = None,
-    cookie_header: str | None = None,
-    cookies_file: Path | None = None,
-    default_cookies_file: Path | None = None,
     headless: bool = False,
 ) -> Iterator[EbayBrowserSession]:
-    if cookies is None:
-        cookies = load_ebay_cookies(
-            cookie_header=cookie_header,
-            cookies_file=cookies_file,
-            default_cookies_file=default_cookies_file,
-        )
-
     ensure_playwright_chromium_installed()
     with sync_playwright() as playwright:
-        session = EbayBrowserSession(playwright, cookies, headless=headless)
+        session = EbayBrowserSession(playwright, headless=headless)
         try:
             yield session
         finally:

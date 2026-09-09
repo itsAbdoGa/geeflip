@@ -13,7 +13,6 @@ OUTPUT_DIR = DATA_DIR / "output"
 
 COMBINED_XLSX = PROJECT_ROOT / "clean" / "10krows with List 1 6-25.xlsx"
 EBAY_SOURCE_HTML = INPUT_DIR / "ebay_source.html"
-EBAY_COOKIES_FILE = INPUT_DIR / "ebay_cookies.txt"
 WINNING_LISTINGS_XLSX = OUTPUT_DIR / "winning_listings.xlsx"
 WINNING_LISTINGS_JSON = JSON_DIR / "winning_listings_live.json"
 WINNING_LISTINGS_HISTORY_JSON = JSON_DIR / "winning_listings_history.json"

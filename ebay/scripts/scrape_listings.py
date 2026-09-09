@@ -18,7 +18,6 @@ from lib.ebay_scraper import (
     BROWSER_RESTART_EVERY,
     EbayShipToNotUsError,
     browser_session,
-    describe_ebay_cookie_session,
     evaluate_winning_listing,
     fetch_amazon_sales_rank,
     fill_missing_seller_reviews,
@@ -28,7 +27,6 @@ from lib.ebay_scraper import (
     format_block_log,
     format_cheapest_listing_log,
     is_browser_crash,
-    load_ebay_cookies,
     log_page_debug,
     parse_price,
     refresh_and_verify_ship_to_us,
@@ -38,7 +36,6 @@ from lib.ebay_scraper import (
 )
 from lib.paths import (
     COMBINED_XLSX,
-    EBAY_COOKIES_FILE,
     IDENTIFIER_NO_MATCH_HISTORY_JSON,
     WINNING_LISTINGS_JSON,
     WINNING_LISTINGS_HISTORY_JSON,
@@ -103,8 +100,6 @@ class ScrapeSettings:
     identifier_no_match_retention_days: int = 3
 
     html_path: Path | None = None
-    cookies_file: Path | None = EBAY_COOKIES_FILE
-    cookie_header: str | None = None
 
     headless: bool = False
     write_xlsx: bool = True
@@ -1660,17 +1655,12 @@ def main(settings: ScrapeSettings | None = None) -> int:
                     )
                 )
         else:
-            cookies = load_ebay_cookies(
-                cookie_header=settings.cookie_header,
-                cookies_file=settings.cookies_file,
-                default_cookies_file=EBAY_COOKIES_FILE,
-            )
             mode_label = "headless" if settings.headless else "headed"
             print(f"Scraping {total} eBay search URLs with Playwright ({mode_label})")
-            print(f"eBay session: {describe_ebay_cookie_session(cookies)}")
+            print("eBay session: guest (no cookies)")
             if BROWSER_RESTART_EVERY:
                 print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
-            with browser_session(cookies=cookies, headless=settings.headless) as session:
+            with browser_session(headless=settings.headless) as session:
                 skipped_previous_ean_for_ship_to = False
                 searches_since_browser_start = 0
                 for index, product in enumerate(products, start=1):

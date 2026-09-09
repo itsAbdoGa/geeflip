@@ -10,7 +10,6 @@ sys.path.insert(0, str(ROOT))
 
 from lib.paths import (
     COMBINED_XLSX,
-    EBAY_COOKIES_FILE,
     INPUT_DIR,
     OUTPUT_DIR,
     WINNING_LISTINGS_XLSX,
@@ -33,7 +32,6 @@ def print_status() -> None:
     print()
     for label, path in (
         ("Workbook", COMBINED_XLSX),
-        ("Cookies", EBAY_COOKIES_FILE),
         ("Winners", WINNING_LISTINGS_XLSX),
     ):
         status = "ok" if path.exists() else "missing"

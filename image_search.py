@@ -1,6 +1,6 @@
 """Simulate eBay visual search from the first listing image (headed Playwright)."""
 
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 import re
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -15,45 +15,6 @@ INSPECT_SECONDS = 2
 NAV_TIMEOUT_MS = 30000
 OVERLAY_TIMEOUT_MS = 500
 EXPECTED_IMAGE = "https://i.ebayimg.com/images/g/bCsAAeSwHUpqmJbW/s-l500.webp"
-COOKIE_HEADER = (
-    "__uzma=7a5339c5-fc0e-4250-ad42-3372fd37a630; __uzmb=1788345913; __uzme=8423; "
-    "utag_main__sn=1; __ssds=2; __ssuzjsr2=a9be0cd8e; "
-    "__uzmaj2=195173b8-f678-4023-9f85-c0a6b1aac47c; __uzmbj2=1788345918; "
-    "s=CgAD4ACBqmpE7NjFiOGY3NWQxYTAwYWFiMjg4MTcxYmYwZmRiNjk2MDLEdoFz; "
-    "ak_bmsc=13D18CD0223C37B81A37A85A44858214~000000000000000000000000000000~YAAQqEAQAiAIxDWgAQAAIib6ZwFb+n9BftxIXW0BWje+UZ/aR35024CG+hdmfQi6tvMigXD5OwAB/nRhzYLHtZc25Pqv0fTc2LaZqUUhXgx2ESelSQk8pjZShOjBMPSi6K4pVDyt6KkXx1aqpCIRLwaQaVjJJGNCbhCe5uOZ65E3YZ5B91QvhIUlqKGgbvSJSpNqfXUUXQSJ69ryPxWT8AndOWWBG0AWfXpqYJovhZku6zEIRGmCL5vnLJC8ztOOqDvzOCfG/7anT+TlpKW87mVNkGKiKcAlxL5bcHOBkHfVHy6cp51NIZfOq7K8ZyB7GTKlhZDUULciLVolnEOKYnT7CczfhMcwQJjfg+30DfX3B/XbSaJdzcX0qoZ9eAvqPq2SKZhJIM/s5t0=; "
-    "__uzmlj2=c1e8Ro7/TVFIIj9e+NLeM6aJeX12qQz+6gQLlVfnsL4=; "
-    "bm_sv=50EC4C1756511C277CD8D12D94A4B783~YAAQGlUQYNUAZ0WgAQAAIvspaAF4nkWMJYqkYloK0S3MG7NYBUNIxMWqlF5haQ6rPNzpMhmWPSPFFwP2BENRuvvl7IEr+dY0QZrn4ESMUsGosuXzvk+FZxuUUP9DJ30HpqwSNDktADfr0S/qNtiVGTeRcFgXz2x/ycIqjFH1SMpOsu7rM4BG2x4hTLxERrBv5DwHiXmv+NIqCE73APRft4unxGlyVT9yjGeigbmnYZ1Rt5s0JixbTWj7TkLOPQ==~1; "
-    "ds2=asotr/b8_5azzzzzzz^msg/61b8f75d1a00aab288171bf0fdb69602^sotr/b8_5az8wzmHq^; "
-    "ebay=%5Ejs%3D1%5Esbf%3D%23000000%5E; "
-    "__uzmcj2=267975825200; __uzmdj2=1788454487; "
-    "__uzmfj2=7f6000170d2146-819d-4c95-bf68-110797462a6f1788345918579108568953-7288b7ffca9192c558; "
-    "__uzmc=90432131548893; __uzmd=1788454487; "
-    "__uzmf=7f6000170d2146-819d-4c95-bf68-110797462a6f1788345913170108574672-e52a320e7c5712cb1315; "
-    "ds2=asotr/b8_5az8wzmHq^msg/61b8f75d1a00aab288171bf0fdb69602^; "
-    "totp=1788454587832.Opa8huo48ND3YDlCb5HYmrFFcnmQE5FF1iYHjJ8ifynQM4pgv1gYdR8dRBDcZPD7gHedGrY60pJVX3E9mtkd1Q==.X00NDtcOWAHSyuu2WTAVcypWvm5iiB2ZV5Amy458_dk; "
-    "bm_so=1D0B13B957C881F1890866B77C99B86353DC9A54C11E57385E7729840B2AFD74~YAAQnEAQAm27/z+gAQAAiVIzaAgd2QP5/6sOzDOhhezX5hJu3n2r27ITTjy+0jlYOnJBXTjiqSVDmsOt13hv045oS1Kp2FTBHuCBVJcv6vSewMANd8ZiiPCUv4fQ7j+RoztSwyKInnMFjx87f8id5Yuy95giZmfpNUavplbb8sRVBKVLCKGL1+1kECPjYmhvB4K+pr2zbTzDh41eLzYqPK/JRd2M1gEwGOd5OGAZGrkpA/1uVnaUSeL2M7FMRrwcD4x9yc6uMp0y8VZF0RkJqP1KQluwjv9HX4xlvHYHFPjB9YmiM5b7YbH04jSAS/w+FVRwJo8DIBVMsAPhyh/B57PVZNMqdjQoQprm0LewNhS9QYJlhAC2wNlREtK72Gcmj0Wd7f83/UCijVkpSD7ZiifvHbqXHHqq2WnfAB+0LoGo6MmvPsrkcb7EdCWZCCQ2TXLmatVTIKfY27PIaveyvTc=; "
-    "bm_lso=1D0B13B957C881F1890866B77C99B86353DC9A54C11E57385E7729840B2AFD74~YAAQnEAQAm27/z+gAQAAiVIzaAgd2QP5/6sOzDOhhezX5hJu3n2r27ITTjy+0jlYOnJBXTjiqSVDmsOt13hv045oS1Kp2FTBHuCBVJcv6vSewMANd8ZiiPCUv4fQ7j+RoztSwyKInnMFjx87f8id5Yuy95giZmfpNUavplbb8sRVBKVLCKGL1+1kECPjYmhvB4K+pr2zbTzDh41eLzYqPK/JRd2M1gEwGOd5OGAZGrkpA/1uVnaUSeL2M7FMRrwcD4x9yc6uMp0y8VZF0RkJqP1KQluwjv9HX4xlvHYHFPjB9YmiM5b7YbH04jSAS/w+FVRwJo8DIBVMsAPhyh/B57PVZNMqdjQoQprm0LewNhS9QYJlhAC2wNlREtK72Gcmj0Wd7f83/UCijVkpSD7ZiifvHbqXHHqq2WnfAB+0LoGo6MmvPsrkcb7EdCWZCCQ2TXLmatVTIKfY27PIaveyvTc=~1788454588341; "
-    "bm_s=YAAQnEAQAqK7/z+gAQAA9VozaAaMfISnzOrntkzOkanHD+T95c0rfouUxUnmjElS9/IvsqITj2UihpJ7mYy7f/irJqN7xB9QYW8RUbARlKVW16x6cfnvKH3K0z8WgKenJ7Ias4ieSrD7VB0x20Nxe4a8X5SS+2+DooGHsa9lRP2dsp8FWgY4rQTRJ5HNSlI92OF1KUlrcx3Tbo3Ezn8lSqS06gJbRySOqRKuGze6UQJVVfA0mdeHKQ53v3F0YFSdWZAyqyEzhnglnbb/WVMZi0Fm7CTytFJGDZUqEWTdtZTooomnetrBJfiUxlxab7AozMUxIlP44kGp2raPoSCEJay6hxaDII+5GbWVttMTltFj/yOkSB8JtnOEQG1B7d7lW8//CCCpxzrfD6ZoJDFIGeKrx5O069iaoWoPVnS3hr2zW/m/ROYmfxgugYF2r5CHe46XwumvWGOjGJyUbZU4v+AbA4Q7VzQpB8Qvp5RgAHFmF0SEgrZ9E29Daa7rkHZDu3w92JRAP6uC58FDwRv5nAghW2kaKgbhuX1pjFAc7wgJ9IBEu+ZyzgSU43AP26bx+T0b5CfCLADpZPuJKGsCfiq73Bh8mVZSU6KapZXmkqZsWdh5IU4/n6SLRRdrk/p3RP2xCRIJsTbGTukiYvgL0/Oebj+Bs5yHpqFCXfT7QinWrvlvkC17t6H8NPgFECtQd+fZunm5MDD70GIgBqWwIGV3XLw21aMXLx/kFLbusxu0LZom2flGIrFkL/bhx53cENy2F/IgV05iEw9KL5TQo52Nm02J1mfZDmgE5AM77PY8onSvdu+fRbEhH/NQU7efbN62h/uuLF+53LKyiipA0JeJrYgeZfrsqmcqhqvtMfo6OSMXer+dmg9e8OjjDfDRRvpIQQLt1jAVUi+P7vzkHpGvcmjECwDO13xkP6SSir61Y7O8IA+5FWtOpXwkPk+V472831jpJ9WOLjY9Dur4/jp7MU1wWsW2jC/nOVazYH5ecvXIBtbSx7v+RPdj63c8E0/DhacJAgRLUeWHoKn3n05vQiknhL3nUQbohYwSSSnnQuMMFP1EphsxbkNHf3bjJQ==; "
-    "ns1=BAQAAAZ5muxf0AAaAANgAU2x62j9jNjl8NjAxXjE3ODgzNDc2Njk3MDZeXjFeM3wyfDV8NHw3fDEwfDQyfDQzfDExXl5eNF4zXjEyXjEyXjJeMV4xXjBeMV4wXjFeNjQ0MjQ1OTA3Nc5p9WCXPmK2QaUX8Fwj5byDIJUj; "
-    "nonsession=BAQAAAZ5muxf0AAaAADMACWx62j83MzA3MixVU0EAygAgblwNvzYxYjhmNzVkMWEwMGFhYjI4ODE3MWJmMGZkYjY5NjAyAMsAAmqZrccyNmGpoKNmq4kxH97t8uyzd4vX304p; "
-    "dp1=bpbf/%23e000000000000000006c7ada3f^bl/DZen-US6e5c0dbf^"
-)
-
-
-def cookies_from_header(header, domain=".ebay.com"):
-    cookies = {}
-    for part in header.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        cookies[name.strip()] = {
-            "name": name.strip(),
-            "value": unquote(value),
-            "domain": domain,
-            "path": "/",
-        }
-    return list(cookies.values())
 
 
 def goto(page, url):
@@ -243,9 +204,6 @@ def main():
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
-        cookies = cookies_from_header(COOKIE_HEADER)
-        context.add_cookies(cookies)
-        print(f"Loaded {len(cookies)} cookies")
         page = context.new_page()
         page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
 

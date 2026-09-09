@@ -3,11 +3,11 @@
 
 # Browser profiles hold cookies/session data
 **/data/browser/
+**/ebay_cookies.txt
 
 # GEEFLIP local database
 geeflip/data/*.db
 geeflip/data/*.db-*
-!geeflip/data/ebay_cookies.txt
 
 # Python
 __pycache__/

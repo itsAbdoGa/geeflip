@@ -26,7 +26,6 @@ for path in (str(GEEFLIP_ROOT), str(EBAY_ROOT), str(PROJECT_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from cookies import read_cookie, write_cookie, cookie_status
 from db import GeeflipStore
 from lib.ebay_scraper import ensure_playwright_chromium_installed
 from scrape_runner import ScrapeRunner, coerce_filters
@@ -215,7 +214,6 @@ async def live_updates(websocket: WebSocket, after: int = 0) -> None:
                 snapshot["winners_run"],
                 snapshot["winners_total"],
                 snapshot["exit_code"],
-                snapshot.get("cookies"),
             )
             if status_key != last_status_key:
                 await websocket.send_json({"type": "status", "status": snapshot})
@@ -277,32 +275,6 @@ def asins(q: str = "", offset: int = 0, limit: int = 50) -> dict:
         offset=max(0, offset),
         limit=max(1, min(limit, 200)),
     )
-
-
-@app.get("/api/admin/cookie")
-def get_cookie() -> dict:
-    status = cookie_status()
-    status["cookie"] = read_cookie()
-    return status
-
-
-@app.post("/api/admin/cookie")
-def update_cookie(payload: dict = Body(...)) -> dict:
-    cookie = str(payload.get("cookie") or "").strip()
-    if cookie and "=" not in cookie:
-        raise HTTPException(
-            status_code=400,
-            detail="That does not look like a cookie header (expected name=value pairs).",
-        )
-    write_cookie(cookie)
-    status = cookie_status()
-    status["cookie"] = read_cookie()
-    if cookie and not status["present"]:
-        raise HTTPException(
-            status_code=400,
-            detail="No location/zip cookies found. Need dp1, nonsession, ns1, ebay, or zip.",
-        )
-    return status
 
 
 app.mount("/static", StaticFiles(directory=GEEFLIP_ROOT / "static"), name="static")
