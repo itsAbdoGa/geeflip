@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import subprocess
@@ -19,8 +20,9 @@ if str(PROJECT_ROOT) not in sys.path:
 import image_search
 
 PAGE_TIMEOUT_MS = 25_000
-RESULTS_SELECTOR_TIMEOUT_MS = 4_000
+RESULTS_SELECTOR_TIMEOUT_MS = 20_000
 VISUAL_SEARCH_RESULTS_TIMEOUT_MS = 8_000
+CHALLENGE_WAIT_TIMEOUT_MS = 35_000
 
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -39,10 +41,6 @@ LINUX_BROWSER_ARGS = [
 BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
 BROWSER_WARMUP_ATTEMPTS = 3
-HEAVY_ASSET_RE = re.compile(
-    r".*\.(?:png|jpe?g|gif|webp|svg|avif|ico|woff2?|ttf|otf|mp4|webm)(?:\?.*)?$",
-    re.I,
-)
 
 STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -60,6 +58,7 @@ BLOCK_MARKERS = (
     "are you a robot",
     "pardon our interruption",
     "checking your browser before accessing",
+    "checking your browser before you access",
     "please verify yourself to continue",
 )
 
@@ -102,6 +101,11 @@ SHIP_TO_CONTAINER_SELECTOR = ".gh-ship-to"
 SHIP_TO_US_ICON_SELECTOR = ".gh-ship-to .fl-us, .gh-ship-to__menu-icon.fl-us"
 SHIP_TO_WAIT_TIMEOUT_MS = 8_000
 SHIP_TO_RETRY_WAIT_SECONDS = 3.0
+DEFAULT_SHIP_ZIP = "73072"
+DEFAULT_SHIP_COUNTRY = "USA"
+DEFAULT_SHIP_LATITUDE = 35.2226
+DEFAULT_SHIP_LONGITUDE = -97.4395
+_ZIP_COUNTRY_RE = re.compile(r"^\d{3,10},[A-Z]{2,3}$")
 MIN_RESULTS_PAGE_BYTES = 10_000
 BODY_PREVIEW_CHARS = 500
 HTML_DEBUG_CHARS = 12_000
@@ -266,7 +270,7 @@ def extract_seller_from_listing_html(html: str) -> tuple[str, int | None]:
 
 
 def fetch_listing_seller_details(page: Page, url: str) -> tuple[str, int | None]:
-    page.goto(url, wait_until="commit", timeout=0)
+    goto_ebay(page, url)
     try:
         page.wait_for_selector(
             SELLER_CARD_SELECTOR,
@@ -491,11 +495,69 @@ def verify_ship_to_us(page: Page) -> None:
 
 
 def refresh_and_verify_ship_to_us(page: Page) -> None:
-    page.reload(
-        wait_until="domcontentloaded",
-        timeout=PAGE_TIMEOUT_MS,
-    )
+    try:
+        set_ship_to_united_states(page)
+    except Exception as error:
+        print(f"Ship-to dialog failed ({error}); reloading homepage", flush=True)
+        goto_ebay(page, "https://www.ebay.com/")
+        try:
+            set_ship_to_united_states(page)
+        except Exception as retry_error:
+            print(f"Ship-to dialog retry failed: {retry_error}", flush=True)
+            page.reload(
+                wait_until="domcontentloaded",
+                timeout=PAGE_TIMEOUT_MS,
+            )
+            wait_out_ebay_challenge(page)
     verify_ship_to_us(page)
+
+
+def set_ship_to_united_states(
+    page: Page,
+    zip_code: str = DEFAULT_SHIP_ZIP,
+) -> None:
+    print(f"Setting Ship to United States ({zip_code})", flush=True)
+    menu = page.locator(".gh-ship-to button.gh-ship-to__menu").first
+    menu.wait_for(state="visible", timeout=SHIP_TO_WAIT_TIMEOUT_MS)
+    menu.click()
+    dialog = page.locator(".gh-ship-to__lightbox").first
+    dialog.wait_for(state="visible", timeout=SHIP_TO_WAIT_TIMEOUT_MS)
+
+    country = dialog.locator(
+        "button.listbox-button__control, "
+        "input[role='combobox'], "
+        "select, "
+        "input[aria-label*='Country' i], "
+        "input[placeholder*='Country' i]"
+    ).first
+    country.click(timeout=SHIP_TO_WAIT_TIMEOUT_MS)
+    option = page.locator("[role='option']").filter(
+        has_text=re.compile(r"United States", re.I)
+    ).first
+    try:
+        option.wait_for(state="visible", timeout=2_000)
+    except PlaywrightTimeoutError:
+        page.keyboard.type("United States", delay=40)
+        option.wait_for(state="visible", timeout=SHIP_TO_WAIT_TIMEOUT_MS)
+    option.click()
+
+    zip_box = dialog.locator(
+        "input[aria-label*='ZIP' i], "
+        "input[aria-label*='zip' i], "
+        "input[placeholder*='ZIP' i], "
+        "input[name*='zip' i], "
+        "input[type='text'], "
+        "input[type='tel']"
+    ).first
+    zip_box.fill(zip_code)
+
+    done = dialog.get_by_role("button", name=re.compile(r"^(Done|Apply|Save)$", re.I))
+    done.first.click()
+    try:
+        dialog.wait_for(state="hidden", timeout=SHIP_TO_WAIT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        page.keyboard.press("Escape")
+    time.sleep(1.0)
 
 
 def filter_us_listings(listings: list[dict]) -> list[dict]:
@@ -1234,6 +1296,58 @@ def _cookie_entry(name: str, value: str) -> dict:
     }
 
 
+def _zip_country_blob(zip_code: str, country: str) -> str:
+    return (
+        base64.b64encode(f"{zip_code},{country}".encode("ascii"))
+        .decode("ascii")
+        .rstrip("=")
+    )
+
+
+def replace_nonsession_zip(
+    nonsession: str,
+    zip_code: str = DEFAULT_SHIP_ZIP,
+    country: str = DEFAULT_SHIP_COUNTRY,
+) -> str:
+    new_blob = _zip_country_blob(zip_code, country)
+    if new_blob in nonsession:
+        return nonsession
+    target = f"{zip_code},{country}"
+    for start in range(0, len(nonsession) - 12 + 1):
+        blob = nonsession[start : start + 12]
+        try:
+            decoded = base64.b64decode(blob).decode("ascii")
+        except Exception:
+            continue
+        if not _ZIP_COUNTRY_RE.fullmatch(decoded):
+            continue
+        if decoded == target:
+            return nonsession
+        return nonsession[:start] + new_blob + nonsession[start + 12 :]
+    return nonsession
+
+
+def strip_dp1_identity(value: str) -> str:
+    """Drop personal identity fields so a datacenter IP is not tied to a login."""
+    parts = []
+    for part in (value or "").split("^"):
+        if not part:
+            continue
+        lowered = part.casefold()
+        if lowered.startswith("bu1p/") or lowered.startswith("u1f/"):
+            continue
+        parts.append(part)
+    result = "^".join(parts)
+    if value.endswith("^") and result:
+        result += "^"
+    return result
+
+
+def rewrite_dp1_for_us(value: str) -> str:
+    value = strip_dp1_identity(value)
+    return re.sub(r"(^|\^)bl/[A-Za-z]{2}", r"\1bl/US", value)
+
+
 def parse_cookie_header(cookie_header: str) -> list[dict]:
     # Last value wins when the header repeats a name (e.g. ds2).
     by_name: dict[str, dict] = {}
@@ -1248,11 +1362,22 @@ def parse_cookie_header(cookie_header: str) -> list[dict]:
         if not name:
             continue
 
-        by_name[name] = _cookie_entry(name, value)
+        lowered = name.casefold()
+        if lowered == "dp1":
+            value = rewrite_dp1_for_us(value)
+        elif lowered == "nonsession":
+            value = replace_nonsession_zip(value)
+        elif lowered == "zip":
+            value = DEFAULT_SHIP_ZIP
+        by_name[lowered] = _cookie_entry(name, value)
+
+    if by_name and "zip" not in by_name:
+        by_name["zip"] = _cookie_entry("zip", DEFAULT_SHIP_ZIP)
+
     return [
         cookie
-        for cookie in by_name.values()
-        if cookie["name"].casefold() in EBAY_LOCATION_COOKIE_NAMES
+        for name, cookie in by_name.items()
+        if name in EBAY_LOCATION_COOKIE_NAMES
     ]
 
 
@@ -1276,7 +1401,14 @@ def load_ebay_cookies(
     if not header:
         return []
 
-    return parse_cookie_header(header)
+    cookies = parse_cookie_header(header)
+    if cookies:
+        print(
+            f"Forcing ship-to {DEFAULT_SHIP_ZIP} {DEFAULT_SHIP_COUNTRY} "
+            "in location cookies",
+            flush=True,
+        )
+    return cookies
 
 
 def describe_ebay_cookie_session(cookies: list[dict]) -> str:
@@ -1311,36 +1443,142 @@ def create_browser_context(
     )
     context = browser.new_context(
         locale="en-US",
-        timezone_id="America/New_York",
+        timezone_id="America/Chicago",
+        geolocation={
+            "latitude": DEFAULT_SHIP_LATITUDE,
+            "longitude": DEFAULT_SHIP_LONGITUDE,
+        },
+        permissions=["geolocation"],
         viewport=viewport,
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
     apply_cookies_to_context(context, cookies or [])
-    if headless:
-        context.route(HEAVY_ASSET_RE, lambda route: route.abort())
     return context
 
 
+def is_ebay_challenge_url(url: str) -> bool:
+    return "splashui/challenge" in (url or "").casefold()
+
+
+def page_is_ebay_challenge(page: Page) -> bool:
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    if is_ebay_challenge_url(url):
+        return True
+    try:
+        title = (page.title() or "").casefold()
+    except Exception:
+        title = ""
+    return "pardon our interruption" in title
+
+
+def wait_out_ebay_challenge(
+    page: Page,
+    *,
+    timeout_ms: int = CHALLENGE_WAIT_TIMEOUT_MS,
+) -> bool:
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=5_000)
+    except Exception:
+        pass
+    if not page_is_ebay_challenge(page):
+        return False
+    print("eBay bot-check splash detected; waiting for redirect...", flush=True)
+    try:
+        page.wait_for_url(
+            lambda landed: not is_ebay_challenge_url(landed),
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+        try:
+            page.wait_for_function(
+                """() => {
+                    const title = (document.title || '').toLowerCase();
+                    if (title.includes('pardon our interruption')) return false;
+                    const heading = document.querySelector('.pgHeading, h1');
+                    const text = ((heading && heading.innerText) || '').toLowerCase();
+                    return !text.includes('checking your browser');
+                }""",
+                timeout=8_000,
+            )
+        except PlaywrightTimeoutError:
+            pass
+        print(f"eBay bot-check finished; now at {page.url}", flush=True)
+        return True
+    except PlaywrightTimeoutError:
+        current = ""
+        try:
+            current = page.url or ""
+        except Exception:
+            pass
+        print(
+            f"eBay bot-check still showing after {timeout_ms}ms: {current}",
+            flush=True,
+        )
+        raise EbayBlockedError(
+            url=current,
+            status_code=0,
+            final_url=current,
+            content_length=0,
+            reason="bot-check splash did not redirect",
+            body_preview="Pardon Our Interruption / Checking your browser",
+        )
+
+
+def goto_ebay(page: Page, url: str, *, wait_until: str = "domcontentloaded"):
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = page.goto(
+                url,
+                wait_until=wait_until,
+                timeout=PAGE_TIMEOUT_MS,
+            )
+            wait_out_ebay_challenge(page)
+            return response
+        except Exception as error:
+            text = str(error)
+            recoverable = (
+                "ERR_ABORTED" in text
+                or "interrupted" in text.casefold()
+                or "navigating and changing the content" in text.casefold()
+            )
+            if not recoverable:
+                raise
+            print(
+                f"Navigation interrupted (attempt {attempt}/3): {error}",
+                flush=True,
+            )
+            wait_out_ebay_challenge(page)
+            last_error = error
+    raise last_error
+
+
 def warm_up_session(page: Page, *, headless: bool = False) -> None:
-    if headless:
-        print("Playwright: skipping eBay homepage warmup in headless mode", flush=True)
-        return
-    page.goto(
-        "https://www.ebay.com/",
-        wait_until="domcontentloaded",
-        timeout=0,
-    )
+    print("Opening eBay homepage to pass bot-check and set ship-to", flush=True)
+    goto_ebay(page, "https://www.ebay.com/")
     try:
         verify_ship_to_us(page)
+        print("Ship to is already United States", flush=True)
         return
     except EbayShipToNotUsError as error:
-        print(f"Ship to is not US on browser open: {error}")
-        print("Refreshing homepage and waiting before checking again")
+        print(f"Ship to is not US on browser open: {error}", flush=True)
+    try:
+        set_ship_to_united_states(page)
+        verify_ship_to_us(page)
+        return
+    except Exception as error:
+        print(f"Could not set Ship to via dialog: {error}", flush=True)
+        print("Refreshing homepage and waiting before checking again", flush=True)
         page.reload(
             wait_until="domcontentloaded",
             timeout=PAGE_TIMEOUT_MS,
         )
+        wait_out_ebay_challenge(page)
         time.sleep(SHIP_TO_RETRY_WAIT_SECONDS)
+        set_ship_to_united_states(page)
         verify_ship_to_us(page)
 
 
@@ -1549,11 +1787,7 @@ def browser_session(
 
 
 def fetch_search_page(page: Page, url: str) -> PageFetchResult:
-    response = page.goto(
-        url,
-        wait_until="commit",
-        timeout=0,
-    )
+    response = goto_ebay(page, url)
     try:
         page.wait_for_selector(
             SEARCH_READY_SELECTOR,
@@ -1562,7 +1796,10 @@ def fetch_search_page(page: Page, url: str) -> PageFetchResult:
         )
         html = page.content()
     except PlaywrightTimeoutError as error:
-        html = page.content()
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
         tree = HTMLParser(html)
         if not (
             has_zero_search_results(tree)
@@ -1645,7 +1882,7 @@ def wait_for_visual_search_results(page: Page) -> str:
     if page.url != filtered:
         print(f"Image search URL:\n  {page.url}")
         print(f"Reloading with required filters:\n  {filtered}")
-        page.goto(filtered, wait_until="commit", timeout=0)
+        goto_ebay(page, filtered)
         print(f"Filtered image search URL:\n  {page.url}")
     else:
         print("Image search URL already has LH_BIN, LH_ItemCondition, LH_PrefLoc.")
