@@ -33,8 +33,6 @@ BROWSER_ARGS = [
 LINUX_BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
-    "--disable-gpu",
-    "--disable-software-rasterizer",
     "--mute-audio",
 ]
 BROWSER_RESTART_EVERY = 1000
@@ -1400,38 +1398,38 @@ def wait_out_ebay_challenge(
     timeout_ms: int = CHALLENGE_WAIT_TIMEOUT_MS,
 ) -> bool:
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=5_000)
-    except Exception:
-        pass
-    if not page_is_ebay_challenge(page):
+        if not page_is_ebay_challenge(page):
+            return False
+    except Exception as error:
+        if is_browser_crash(error):
+            raise
         return False
-    print("eBay bot-check splash detected; waiting for redirect...", flush=True)
-    try:
-        page.wait_for_url(
-            lambda landed: not is_ebay_challenge_url(landed),
-            wait_until="domcontentloaded",
-            timeout=timeout_ms,
-        )
-        print(f"eBay bot-check finished; now at {page.url}", flush=True)
-        return True
-    except PlaywrightTimeoutError:
-        current = ""
+
+    print("eBay bot-check splash detected; polling until it redirects...", flush=True)
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    last_url = ""
+    while time.monotonic() < deadline:
+        time.sleep(0.75)
         try:
-            current = page.url or ""
-        except Exception:
-            pass
-        print(
-            f"eBay bot-check still showing after {timeout_ms}ms: {current}",
-            flush=True,
-        )
-        raise EbayBlockedError(
-            url=current,
-            status_code=0,
-            final_url=current,
-            content_length=0,
-            reason="bot-check splash did not redirect",
-            body_preview="Pardon Our Interruption / Checking your browser",
-        )
+            last_url = page.url or last_url
+            if not page_is_ebay_challenge(page):
+                print(f"eBay bot-check finished; now at {page.url}", flush=True)
+                return True
+        except Exception as error:
+            if is_browser_crash(error):
+                raise
+    print(
+        f"eBay bot-check still showing after {timeout_ms}ms: {last_url}",
+        flush=True,
+    )
+    raise EbayBlockedError(
+        url=last_url,
+        status_code=0,
+        final_url=last_url,
+        content_length=0,
+        reason="bot-check splash did not redirect",
+        body_preview="Pardon Our Interruption / Checking your browser",
+    )
 
 
 def goto_ebay(page: Page, url: str, *, wait_until: str = "domcontentloaded"):
@@ -1483,7 +1481,17 @@ def create_browser_context(
     context.add_init_script(STEALTH_INIT_SCRIPT)
     apply_cookies_to_context(context, cookies or [])
     if compact:
-        context.route(HEAVY_ASSET_RE, lambda route: route.abort())
+        def _maybe_abort_heavy(route) -> None:
+            url = route.request.url.casefold()
+            if "splashui" in url or "challenge" in url:
+                route.continue_()
+                return
+            if HEAVY_ASSET_RE.search(route.request.url):
+                route.abort()
+                return
+            route.continue_()
+
+        context.route(HEAVY_ASSET_RE, _maybe_abort_heavy)
     return context
 
 
@@ -1492,6 +1500,7 @@ def warm_up_session(page: Page) -> None:
     try:
         goto_ebay(page, "https://www.ebay.com/")
         print(f"Homepage warmup landed on {page.url}", flush=True)
+        time.sleep(2)
         if is_production():
             print("Production scrape: skipping ship-to US check", flush=True)
             return

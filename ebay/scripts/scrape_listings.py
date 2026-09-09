@@ -1713,32 +1713,32 @@ def main(settings: ScrapeSettings | None = None) -> int:
                             "recently had no exact matches"
                         )
                         continue
-                    try:
-                        product_winners = process_live_product_with_ship_to_retry(
-                            session.page,
-                            product,
-                            **process_kwargs(display_index, display_total, live=True),
-                        )
-                    except Exception as error:
-                        if not is_browser_crash(error):
-                            log_page_debug(
-                                reason="scrape failed",
-                                error=error,
-                                page=session.page,
+                    crash_retries = 0
+                    while True:
+                        try:
+                            product_winners = process_live_product_with_ship_to_retry(
+                                session.page,
+                                product,
+                                **process_kwargs(display_index, display_total, live=True),
                             )
-                            raise
-                        print(
-                            "  Browser crashed; restarting, warming up ebay.com, "
-                            f"and retrying this search: {error}",
-                            flush=True,
-                        )
-                        session.restart()
-                        searches_since_browser_start = 0
-                        product_winners = process_live_product_with_ship_to_retry(
-                            session.page,
-                            product,
-                            **process_kwargs(display_index, display_total, live=True),
-                        )
+                            break
+                        except Exception as error:
+                            if not is_browser_crash(error) or crash_retries >= 2:
+                                if not is_browser_crash(error):
+                                    log_page_debug(
+                                        reason="scrape failed",
+                                        error=error,
+                                        page=session.page,
+                                    )
+                                raise
+                            crash_retries += 1
+                            print(
+                                "  Browser crashed; restarting, warming up ebay.com, "
+                                f"and retrying this search ({crash_retries}/2): {error}",
+                                flush=True,
+                            )
+                            session.restart()
+                            searches_since_browser_start = 0
                     keep_winners(product_winners)
         if stop_reason:
             print("Scrape stopped from the website; saving winners collected so far")
