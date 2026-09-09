@@ -30,8 +30,21 @@ BROWSER_ARGS = [
     "--window-position=0,0",
     "--ignore-certificate-errors",
 ]
+LINUX_BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--mute-audio",
+]
 BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
+BROWSER_WARMUP_ATTEMPTS = 3
+CHALLENGE_WAIT_TIMEOUT_MS = 35_000
+HEAVY_ASSET_RE = re.compile(
+    r".*\.(?:png|jpe?g|gif|webp|svg|avif|ico|woff2?|ttf|otf|mp4|webm)(?:\?.*)?$",
+    re.I,
+)
 _PLAYWRIGHT_CHROMIUM_LOCK = threading.Lock()
 _PLAYWRIGHT_CHROMIUM_READY = False
 
@@ -846,6 +859,28 @@ def has_no_exact_search_results(tree: HTMLParser) -> bool:
     return "no exact matches found" in heading.text(separator=" ", strip=True).casefold()
 
 
+def html_has_listing_cards(tree: HTMLParser) -> bool:
+    return bool(
+        tree.css("li.s-card[data-listingid]")
+        or tree.css(".srp-river-results li.s-card")
+        or tree.css(".s-item-card")
+    )
+
+
+def is_browser_crash(error: BaseException) -> bool:
+    text = str(error).casefold()
+    return any(
+        needle in text
+        for needle in (
+            "target crashed",
+            "target closed",
+            "browser has been closed",
+            "browser closed",
+            "page crashed",
+        )
+    )
+
+
 def iter_direct_element_children(node):
     child = node.child
     while child:
@@ -1340,24 +1375,123 @@ def apply_cookies_to_context(context, cookies: list[dict]) -> None:
         context.add_cookies(cookies)
 
 
-def create_browser_context(browser: Browser, *, cookies: list[dict] | None = None):
+def is_ebay_challenge_url(url: str) -> bool:
+    lowered = (url or "").casefold()
+    return "splashui/challenge" in lowered or "/splashui/" in lowered
+
+
+def page_is_ebay_challenge(page: Page) -> bool:
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    if is_ebay_challenge_url(url):
+        return True
+    try:
+        title = (page.title() or "").casefold()
+    except Exception:
+        title = ""
+    return "pardon our interruption" in title
+
+
+def wait_out_ebay_challenge(
+    page: Page,
+    *,
+    timeout_ms: int = CHALLENGE_WAIT_TIMEOUT_MS,
+) -> bool:
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=5_000)
+    except Exception:
+        pass
+    if not page_is_ebay_challenge(page):
+        return False
+    print("eBay bot-check splash detected; waiting for redirect...", flush=True)
+    try:
+        page.wait_for_url(
+            lambda landed: not is_ebay_challenge_url(landed),
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+        print(f"eBay bot-check finished; now at {page.url}", flush=True)
+        return True
+    except PlaywrightTimeoutError:
+        current = ""
+        try:
+            current = page.url or ""
+        except Exception:
+            pass
+        print(
+            f"eBay bot-check still showing after {timeout_ms}ms: {current}",
+            flush=True,
+        )
+        raise EbayBlockedError(
+            url=current,
+            status_code=0,
+            final_url=current,
+            content_length=0,
+            reason="bot-check splash did not redirect",
+            body_preview="Pardon Our Interruption / Checking your browser",
+        )
+
+
+def goto_ebay(page: Page, url: str, *, wait_until: str = "domcontentloaded"):
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = page.goto(
+                url,
+                wait_until=wait_until,
+                timeout=PAGE_TIMEOUT_MS,
+            )
+            wait_out_ebay_challenge(page)
+            return response
+        except Exception as error:
+            if is_browser_crash(error):
+                raise
+            text = str(error)
+            recoverable = (
+                "ERR_ABORTED" in text
+                or "interrupted" in text.casefold()
+                or "navigating and changing the content" in text.casefold()
+            )
+            if not recoverable:
+                raise
+            print(
+                f"Navigation interrupted (attempt {attempt}/3): {error}",
+                flush=True,
+            )
+            try:
+                wait_out_ebay_challenge(page)
+                return None
+            except Exception as wait_error:
+                last_error = wait_error
+    raise last_error
+
+
+def create_browser_context(
+    browser: Browser,
+    *,
+    cookies: list[dict] | None = None,
+    headless: bool = False,
+):
+    compact = headless or is_production()
     context = browser.new_context(
         locale="en-US",
         timezone_id="America/New_York",
-        viewport={"width": 1440, "height": 900},
+        viewport={"width": 1024, "height": 720} if compact else {"width": 1440, "height": 900},
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
     apply_cookies_to_context(context, cookies or [])
+    if compact:
+        context.route(HEAVY_ASSET_RE, lambda route: route.abort())
     return context
 
 
 def warm_up_session(page: Page) -> None:
+    print("Opening https://www.ebay.com/ before scraping listings", flush=True)
     try:
-        page.goto(
-            "https://www.ebay.com/",
-            wait_until="domcontentloaded",
-            timeout=0,
-        )
+        goto_ebay(page, "https://www.ebay.com/")
+        print(f"Homepage warmup landed on {page.url}", flush=True)
         if is_production():
             print("Production scrape: skipping ship-to US check", flush=True)
             return
@@ -1371,6 +1505,7 @@ def warm_up_session(page: Page) -> None:
                 wait_until="domcontentloaded",
                 timeout=PAGE_TIMEOUT_MS,
             )
+            wait_out_ebay_challenge(page)
             time.sleep(SHIP_TO_RETRY_WAIT_SECONDS)
             verify_ship_to_us(page)
     except Exception as error:
@@ -1467,13 +1602,24 @@ def ensure_playwright_chromium_installed() -> None:
         print(f"GEEFLIP: Chromium still unusable after install ({detail})", flush=True)
 
 
+def _chromium_launch_args(*, headless: bool) -> list[str]:
+    args = list(BROWSER_ARGS)
+    if headless or is_production() or os.name != "nt":
+        args.extend(LINUX_BROWSER_ARGS)
+    return args
+
+
 def _launch_chromium(playwright, *, headless: bool):
     kwargs = {
         "headless": headless,
-        "args": BROWSER_ARGS,
+        "args": _chromium_launch_args(headless=headless),
+        "handle_sigint": False,
+        "handle_sigterm": False,
+        "handle_sighup": False,
     }
-    if is_production():
+    if is_production() or headless:
         kwargs["chromium_sandbox"] = False
+    if is_production():
         return playwright.chromium.launch(**kwargs)
     try:
         return playwright.chromium.launch(channel="chrome", **kwargs)
@@ -1487,11 +1633,32 @@ def _launch_chromium(playwright, *, headless: bool):
 
 def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
     ensure_playwright_chromium_installed()
-    browser = _launch_chromium(playwright, headless=headless)
-    context = create_browser_context(browser, cookies=cookies)
-    page = context.new_page()
-    warm_up_session(page)
-    return browser, context, page
+    last_error = None
+    for attempt in range(1, BROWSER_WARMUP_ATTEMPTS + 1):
+        browser = None
+        context = None
+        try:
+            browser = _launch_chromium(playwright, headless=headless)
+            context = create_browser_context(
+                browser,
+                cookies=cookies,
+                headless=headless,
+            )
+            page = context.new_page()
+            warm_up_session(page)
+            return browser, context, page
+        except Exception as error:
+            last_error = error
+            print(
+                f"GEEFLIP: browser warmup failed (attempt {attempt}/"
+                f"{BROWSER_WARMUP_ATTEMPTS}): {error}",
+                flush=True,
+            )
+            close_ebay_browser(browser, context)
+            if attempt == BROWSER_WARMUP_ATTEMPTS:
+                raise
+            time.sleep(BROWSER_RESTART_PAUSE_SECONDS)
+    raise last_error
 
 
 def close_ebay_browser(browser, context) -> None:
@@ -1566,20 +1733,32 @@ def browser_session(
 
 
 def fetch_search_page(page: Page, url: str) -> PageFetchResult:
-    response = page.goto(
-        url,
-        wait_until="commit",
-        timeout=0,
-    )
+    response = goto_ebay(page, url, wait_until="commit")
     try:
         page.wait_for_selector(
             SEARCH_READY_SELECTOR,
             timeout=RESULTS_SELECTOR_TIMEOUT_MS,
+            state="attached",
         )
         html = page.content()
-    except PlaywrightTimeoutError:
-        html = page.content()
-        if not has_zero_search_results(HTMLParser(html)):
+    except PlaywrightTimeoutError as error:
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+        tree = HTMLParser(html)
+        if not (
+            has_zero_search_results(tree)
+            or has_no_exact_search_results(tree)
+            or html_has_listing_cards(tree)
+        ):
+            log_page_debug(
+                reason="search selector timeout",
+                error=error,
+                html=html,
+                url=getattr(page, "url", "") or url,
+                page=page,
+            )
             raise
 
     assert_ship_to_us_html(html)

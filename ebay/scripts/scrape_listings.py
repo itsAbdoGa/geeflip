@@ -18,6 +18,7 @@ from lib.ebay_scraper import (
     BROWSER_RESTART_EVERY,
     EbayShipToNotUsError,
     browser_session,
+    describe_ebay_cookie_session,
     evaluate_winning_listing,
     fetch_amazon_sales_rank,
     fill_missing_seller_reviews,
@@ -26,6 +27,9 @@ from lib.ebay_scraper import (
     format_below_buybox_listing_logs,
     format_block_log,
     format_cheapest_listing_log,
+    is_browser_crash,
+    is_production,
+    load_ebay_cookies,
     log_page_debug,
     parse_price,
     refresh_and_verify_ship_to_us,
@@ -35,6 +39,7 @@ from lib.ebay_scraper import (
 )
 from lib.paths import (
     COMBINED_XLSX,
+    EBAY_COOKIES_FILE,
     IDENTIFIER_NO_MATCH_HISTORY_JSON,
     WINNING_LISTINGS_JSON,
     WINNING_LISTINGS_HISTORY_JSON,
@@ -99,7 +104,7 @@ class ScrapeSettings:
     identifier_no_match_retention_days: int = 3
 
     html_path: Path | None = None
-    cookies_file: Path | None = None
+    cookies_file: Path | None = EBAY_COOKIES_FILE
     cookie_header: str | None = None
 
     headless: bool = False
@@ -1658,12 +1663,20 @@ def main(settings: ScrapeSettings | None = None) -> int:
                     )
                 )
         else:
+            cookies = load_ebay_cookies(
+                cookie_header=settings.cookie_header,
+                cookies_file=settings.cookies_file,
+                default_cookies_file=EBAY_COOKIES_FILE,
+            )
             mode_label = "headless" if settings.headless else "headed"
             print(f"Scraping {total} eBay search URLs with Playwright ({mode_label})")
-            print("eBay session: guest (no cookies)")
+            if is_production():
+                print("eBay session: guest (production, cookies disabled)")
+            else:
+                print(f"eBay session: {describe_ebay_cookie_session(cookies)}")
             if BROWSER_RESTART_EVERY:
                 print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
-            with browser_session(cookies=[], headless=settings.headless) as session:
+            with browser_session(cookies=cookies, headless=settings.headless) as session:
                 searches_since_browser_start = 0
                 for index, product in enumerate(products, start=1):
                     if requested_stop():
@@ -1707,12 +1720,25 @@ def main(settings: ScrapeSettings | None = None) -> int:
                             **process_kwargs(display_index, display_total, live=True),
                         )
                     except Exception as error:
-                        log_page_debug(
-                            reason="scrape failed",
-                            error=error,
-                            page=session.page,
+                        if not is_browser_crash(error):
+                            log_page_debug(
+                                reason="scrape failed",
+                                error=error,
+                                page=session.page,
+                            )
+                            raise
+                        print(
+                            "  Browser crashed; restarting, warming up ebay.com, "
+                            f"and retrying this search: {error}",
+                            flush=True,
                         )
-                        raise
+                        session.restart()
+                        searches_since_browser_start = 0
+                        product_winners = process_live_product_with_ship_to_retry(
+                            session.page,
+                            product,
+                            **process_kwargs(display_index, display_total, live=True),
+                        )
                     keep_winners(product_winners)
         if stop_reason:
             print("Scrape stopped from the website; saving winners collected so far")
