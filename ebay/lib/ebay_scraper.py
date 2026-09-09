@@ -97,13 +97,6 @@ RESULTS_LIST_SELECTORS = ("ul.srp-results", ".srp-river-results")
 INTERNATIONAL_DIVIDER_CLASS = "srp-river-answer--REWRITE_START"
 LISTING_CARD_CLASSES = frozenset({"s-card", "s-item-card"})
 SHIP_TO_CONTAINER_SELECTOR = ".gh-ship-to"
-SHIP_TO_US_ICON_SELECTOR = ".gh-ship-to .fl-us, .gh-ship-to__menu-icon.fl-us"
-SHIP_TO_WAIT_TIMEOUT_MS = 8_000
-SHIP_TO_RETRY_WAIT_SECONDS = 3.0
-DEFAULT_SHIP_ZIP = "73072"
-DEFAULT_SHIP_COUNTRY = "USA"
-DEFAULT_SHIP_LATITUDE = 35.2226
-DEFAULT_SHIP_LONGITUDE = -97.4395
 MIN_RESULTS_PAGE_BYTES = 10_000
 BODY_PREVIEW_CHARS = 500
 HTML_DEBUG_CHARS = 12_000
@@ -178,18 +171,6 @@ class EbayBlockedError(Exception):
             f"status={status_code}, final_url={final_url}, "
             f"bytes={content_length}"
         )
-        super().__init__(message)
-
-
-class EbayShipToNotUsError(Exception):
-    """Raised when the header Ship to control is not set to the United States."""
-
-    def __init__(self, reason: str, *, detail: str = "") -> None:
-        self.reason = reason
-        self.detail = detail
-        message = f"eBay Ship to is not US ({reason})"
-        if detail:
-            message = f"{message}: {detail}"
         super().__init__(message)
 
 
@@ -398,160 +379,6 @@ def extract_shipping(attr_rows: list[str]) -> tuple[str, float | None]:
 
 def is_united_states_listing(location: str) -> bool:
     return US_LOCATION_MARKER in location.casefold()
-
-
-def _class_tokens(node) -> set[str]:
-    raw = node.attributes.get("class") or ""
-    return {part.casefold() for part in raw.split() if part}
-
-
-def is_ship_to_us_html(html: str) -> bool | None:
-    """Return True if Ship to is US, False if present but not US, None if missing."""
-    tree = HTMLParser(html)
-    container = tree.css_first(SHIP_TO_CONTAINER_SELECTOR)
-    if container is None:
-        return None
-
-    for icon in container.css(".gh-ship-to__menu-icon, .fl-pic, i"):
-        if "fl-us" in _class_tokens(icon):
-            return True
-
-    if container.css_first(SHIP_TO_US_ICON_SELECTOR) is not None:
-        return True
-
-    button = container.css_first("button.gh-ship-to__menu")
-    if button is not None:
-        aria = (button.attributes.get("aria-label") or "").casefold()
-        if "united states" in aria:
-            return True
-
-    return False
-
-
-def assert_ship_to_us_html(html: str) -> None:
-    status = is_ship_to_us_html(html)
-    if status is True:
-        return
-    if status is None:
-        raise EbayShipToNotUsError(
-            "missing_ship_to_control",
-            detail=f"selector={SHIP_TO_CONTAINER_SELECTOR}",
-        )
-    raise EbayShipToNotUsError(
-        "not_us",
-        detail="expected .gh-ship-to .fl-us (United States)",
-    )
-
-
-def _ship_to_button(page: Page):
-    return page.query_selector(f"{SHIP_TO_CONTAINER_SELECTOR} button.gh-ship-to__menu")
-
-
-def _ship_to_aria_label(page: Page) -> str:
-    button = _ship_to_button(page)
-    if button is None:
-        return ""
-    return (button.get_attribute("aria-label") or "").strip()
-
-
-def verify_ship_to_us(page: Page) -> None:
-    """Ensure the header Ship to control shows the US flag (fl-us)."""
-    try:
-        page.wait_for_selector(
-            SHIP_TO_CONTAINER_SELECTOR,
-            timeout=SHIP_TO_WAIT_TIMEOUT_MS,
-            state="attached",
-        )
-    except PlaywrightTimeoutError as exc:
-        raise EbayShipToNotUsError(
-            "missing_ship_to_control",
-            detail=f"selector={SHIP_TO_CONTAINER_SELECTOR}",
-        ) from exc
-
-    # Country flag is hydrated async after the container mounts.
-    try:
-        page.wait_for_function(
-            """() => {
-                const icon = document.querySelector('.gh-ship-to .fl-us, .gh-ship-to__menu-icon.fl-us');
-                if (icon) return true;
-                const button = document.querySelector('.gh-ship-to button.gh-ship-to__menu');
-                const aria = (button && button.getAttribute('aria-label') || '').toLowerCase();
-                return aria.includes('united states');
-            }""",
-            timeout=SHIP_TO_WAIT_TIMEOUT_MS,
-        )
-        return
-    except PlaywrightTimeoutError:
-        pass
-
-    detail = _ship_to_aria_label(page) or "no fl-us class on .gh-ship-to__menu-icon"
-    raise EbayShipToNotUsError("not_us", detail=detail)
-
-
-def refresh_and_verify_ship_to_us(page: Page) -> None:
-    try:
-        set_ship_to_united_states(page)
-    except Exception as error:
-        print(f"Ship-to dialog failed ({error}); reloading homepage", flush=True)
-        goto_ebay(page, "https://www.ebay.com/")
-        try:
-            set_ship_to_united_states(page)
-        except Exception as retry_error:
-            print(f"Ship-to dialog retry failed: {retry_error}", flush=True)
-            page.reload(
-                wait_until="domcontentloaded",
-                timeout=PAGE_TIMEOUT_MS,
-            )
-            wait_out_ebay_challenge(page)
-    verify_ship_to_us(page)
-
-
-def set_ship_to_united_states(
-    page: Page,
-    zip_code: str = DEFAULT_SHIP_ZIP,
-) -> None:
-    print(f"Setting Ship to United States ({zip_code})", flush=True)
-    menu = page.locator(".gh-ship-to button.gh-ship-to__menu").first
-    menu.wait_for(state="visible", timeout=SHIP_TO_WAIT_TIMEOUT_MS)
-    menu.click()
-    dialog = page.locator(".gh-ship-to__lightbox").first
-    dialog.wait_for(state="visible", timeout=SHIP_TO_WAIT_TIMEOUT_MS)
-
-    country = dialog.locator(
-        "button.listbox-button__control, "
-        "input[role='combobox'], "
-        "select, "
-        "input[aria-label*='Country' i], "
-        "input[placeholder*='Country' i]"
-    ).first
-    country.click(timeout=SHIP_TO_WAIT_TIMEOUT_MS)
-    option = page.locator("[role='option']").filter(
-        has_text=re.compile(r"United States", re.I)
-    ).first
-    try:
-        option.wait_for(state="visible", timeout=2_000)
-    except PlaywrightTimeoutError:
-        page.keyboard.type("United States", delay=40)
-        option.wait_for(state="visible", timeout=SHIP_TO_WAIT_TIMEOUT_MS)
-    option.click()
-
-    zip_box = dialog.locator(
-        "input[aria-label*='ZIP' i], "
-        "input[aria-label*='zip' i], "
-        "input[placeholder*='ZIP' i], "
-        "input[name*='zip' i], "
-        "input[type='text'], "
-        "input[type='tel']"
-    ).first
-    zip_box.fill(zip_code)
-
-    done = dialog.get_by_role("button", name=re.compile(r"^(Done|Apply|Save)$", re.I))
-    done.first.click()
-    try:
-        dialog.wait_for(state="hidden", timeout=SHIP_TO_WAIT_TIMEOUT_MS)
-    except PlaywrightTimeoutError:
-        page.keyboard.press("Escape")
-    time.sleep(1.0)
 
 
 def filter_us_listings(listings: list[dict]) -> list[dict]:
@@ -1292,12 +1119,7 @@ def create_browser_context(
     )
     context = browser.new_context(
         locale="en-US",
-        timezone_id="America/Chicago",
-        geolocation={
-            "latitude": DEFAULT_SHIP_LATITUDE,
-            "longitude": DEFAULT_SHIP_LONGITUDE,
-        },
-        permissions=["geolocation"],
+        timezone_id="America/New_York",
         viewport=viewport,
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
@@ -1405,29 +1227,8 @@ def goto_ebay(page: Page, url: str, *, wait_until: str = "domcontentloaded"):
 
 
 def warm_up_session(page: Page, *, headless: bool = False) -> None:
-    print("Opening eBay homepage to pass bot-check and set ship-to", flush=True)
+    print("Opening eBay homepage to pass bot-check", flush=True)
     goto_ebay(page, "https://www.ebay.com/")
-    try:
-        verify_ship_to_us(page)
-        print("Ship to is already United States", flush=True)
-        return
-    except EbayShipToNotUsError as error:
-        print(f"Ship to is not US on browser open: {error}", flush=True)
-    try:
-        set_ship_to_united_states(page)
-        verify_ship_to_us(page)
-        return
-    except Exception as error:
-        print(f"Could not set Ship to via dialog: {error}", flush=True)
-        print("Refreshing homepage and waiting before checking again", flush=True)
-        page.reload(
-            wait_until="domcontentloaded",
-            timeout=PAGE_TIMEOUT_MS,
-        )
-        wait_out_ebay_challenge(page)
-        time.sleep(SHIP_TO_RETRY_WAIT_SECONDS)
-        set_ship_to_united_states(page)
-        verify_ship_to_us(page)
 
 
 _PLAYWRIGHT_CHROMIUM_LOCK = threading.Lock()
@@ -1649,17 +1450,6 @@ def fetch_search_page(page: Page, url: str) -> PageFetchResult:
             )
             raise
 
-    try:
-        assert_ship_to_us_html(html)
-    except EbayShipToNotUsError as error:
-        log_page_debug(
-            reason="ship-to check failed after search load",
-            error=error,
-            html=html,
-            url=page.url,
-            page=page,
-        )
-        raise
     status_code = response.status if response is not None else 0
     result = PageFetchResult(
         url=url,
@@ -1778,7 +1568,6 @@ def scrape_image_search_page(
         search_url = run_visual_search(page, image_url)
         result["search_url"] = search_url
         html = page.content()
-        assert_ship_to_us_html(html)
         analyze_page(
             search_url,
             PageFetchResult(
@@ -1838,8 +1627,6 @@ def scrape_search_page(
         )
         result["error"] = str(error)
         return result
-    except EbayShipToNotUsError:
-        raise
     except Exception as error:
         log_page_debug(
             reason="search page exception",
@@ -1864,7 +1651,6 @@ def scrape_search_page_from_html(
         url, title=title, asin=asin, ean=ean, buybox_price=buybox_price
     )
     try:
-        assert_ship_to_us_html(html)
         analyze_page(
             url,
             PageFetchResult(url=url, final_url=url, status_code=200, html=html),

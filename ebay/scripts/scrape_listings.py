@@ -16,7 +16,6 @@ sys.path.insert(0, str(ROOT))
 
 from lib.ebay_scraper import (
     BROWSER_RESTART_EVERY,
-    EbayShipToNotUsError,
     browser_session,
     evaluate_winning_listing,
     fetch_amazon_sales_rank,
@@ -27,9 +26,7 @@ from lib.ebay_scraper import (
     format_block_log,
     format_cheapest_listing_log,
     is_browser_crash,
-    log_page_debug,
     parse_price,
-    refresh_and_verify_ship_to_us,
     scrape_image_search_page,
     scrape_search_page,
     scrape_search_page_from_html,
@@ -1366,32 +1363,10 @@ def process_product(
                     image_search_cache=image_search_cache,
                 )
             )
-        except EbayShipToNotUsError:
-            raise
         except Exception as error:
             print(f"  Image search failed: {type(error).__name__}: {error}")
 
     return product_winners
-
-
-def process_live_product_with_ship_to_retry(
-    page,
-    product: dict[str, str],
-    **kwargs,
-) -> list[dict]:
-    try:
-        return process_product(page, product, saved_html=None, **kwargs)
-    except EbayShipToNotUsError as error:
-        identifier_type, identifier = query_label(product)
-        print(f"  Ship to is not US for {identifier_type} {identifier}: {error}")
-        log_page_debug(
-            reason="ship-to not US before refresh",
-            error=error,
-            page=page,
-        )
-        print("  Refreshing and retrying this search")
-        refresh_and_verify_ship_to_us(page)
-        return process_product(page, product, saved_html=None, **kwargs)
 
 
 def _store_method(store: object | None, name: str):
@@ -1661,7 +1636,6 @@ def main(settings: ScrapeSettings | None = None) -> int:
             if BROWSER_RESTART_EVERY:
                 print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
             with browser_session(headless=settings.headless) as session:
-                skipped_previous_ean_for_ship_to = False
                 searches_since_browser_start = 0
                 for index, product in enumerate(products, start=1):
                     if requested_stop():
@@ -1699,27 +1673,12 @@ def main(settings: ScrapeSettings | None = None) -> int:
                         )
                         continue
                     try:
-                        product_winners = process_live_product_with_ship_to_retry(
+                        product_winners = process_product(
                             session.page,
                             product,
+                            saved_html=None,
                             **process_kwargs(display_index, display_total, live=True),
                         )
-                    except EbayShipToNotUsError as error:
-                        ean = product.get("ean") or product.get("asin") or "(unknown)"
-                        if skipped_previous_ean_for_ship_to:
-                            raise EbayShipToNotUsError(
-                                "consecutive_not_us",
-                                detail=(
-                                    f"EAN {ean} was still not US after refresh; "
-                                    "the previous EAN was also skipped"
-                                ),
-                            ) from error
-                        print(
-                            f"  Skipping EAN {ean}: Ship to is still not US "
-                            "after refresh"
-                        )
-                        skipped_previous_ean_for_ship_to = True
-                        continue
                     except Exception as error:
                         if not is_browser_crash(error):
                             raise
@@ -1729,22 +1688,18 @@ def main(settings: ScrapeSettings | None = None) -> int:
                         )
                         session.restart()
                         searches_since_browser_start = 0
-                        product_winners = process_live_product_with_ship_to_retry(
+                        product_winners = process_product(
                             session.page,
                             product,
+                            saved_html=None,
                             **process_kwargs(display_index, display_total, live=True),
                         )
 
-                    skipped_previous_ean_for_ship_to = False
                     keep_winners(product_winners)
         if stop_reason:
             print("Scrape stopped from the website; saving winners collected so far")
             log_current_stop(stop_reason)
             exit_code = 130
-    except EbayShipToNotUsError as error:
-        print(f"Stopping scrape: {error}")
-        log_current_stop(str(error))
-        exit_code = 1
     except KeyboardInterrupt:
         print("Scrape stopped by user; saving winners collected so far")
         log_current_stop("stopped by user")
