@@ -13,10 +13,11 @@ EBAY_ROOT = PROJECT_ROOT / "ebay"
 if str(EBAY_ROOT) not in sys.path:
     sys.path.insert(0, str(EBAY_ROOT))
 
+from lib.ebay_scraper import ensure_playwright_chromium_installed, is_production
 from lib.paths import COMBINED_XLSX
 from scripts.scrape_listings import ScrapeSettings, main as scrape_main, select_products
 
-from cookies import cookie_status
+from cookies import COOKIE_FILE, cookie_status
 from db import DEFAULT_FILTERS, GeeflipStore
 
 
@@ -149,7 +150,7 @@ def settings_from_filters(
         skip_previously_won=data["skip_previously_won"],
         winner_history_retention_days=data["winner_history_retention_days"],
         identifier_no_match_retention_days=data["identifier_no_match_retention_days"],
-        cookies_file=None,
+        cookies_file=None if is_production() else COOKIE_FILE,
         headless=True,
         write_xlsx=False,
         write_json=False,
@@ -205,7 +206,8 @@ class ScrapeRunner:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "playwright": "headless",
-            "cookies": cookie_status()["present"],
+            "production": is_production(),
+            "cookies": False if is_production() else cookie_status()["present"],
             "catalog": catalog,
             "winners_total": self.store.winner_count(),
             "winners_run": self.store.winner_count(run_id=run_id) if run_id else 0,
@@ -267,6 +269,7 @@ class ScrapeRunner:
         error = None
         try:
             sys.stdout = _LogTee(stdout, self.emit, thread_id=threading.get_ident())
+            ensure_playwright_chromium_installed()
             exit_code = scrape_main(settings)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

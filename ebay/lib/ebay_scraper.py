@@ -389,6 +389,16 @@ def is_united_states_listing(location: str) -> bool:
     return US_LOCATION_MARKER in location.casefold()
 
 
+def html_has_us_ship_to_hint(html: str) -> bool:
+    """Newer eBay headers omit .gh-ship-to; GH boot data still has a US zip."""
+    text = html or ""
+    if re.search(r'"location_country_id"\s*:\s*"1"', text):
+        return True
+    if re.search(r'"shipToLocation"\s*:\s*"\d{5}"', text):
+        return True
+    return False
+
+
 def _class_tokens(node) -> set[str]:
     raw = node.attributes.get("class") or ""
     return {part.casefold() for part in raw.split() if part}
@@ -399,6 +409,8 @@ def is_ship_to_us_html(html: str) -> bool | None:
     tree = HTMLParser(html)
     container = tree.css_first(SHIP_TO_CONTAINER_SELECTOR)
     if container is None:
+        if html_has_us_ship_to_hint(html):
+            return True
         return None
 
     for icon in container.css(".gh-ship-to__menu-icon, .fl-pic, i"):
@@ -452,6 +464,13 @@ def verify_ship_to_us(page: Page) -> None:
             state="attached",
         )
     except PlaywrightTimeoutError as exc:
+        html = page.content()
+        if html_has_us_ship_to_hint(html):
+            print(
+                "Ship-to header control missing; page reports a US location",
+                flush=True,
+            )
+            return
         raise EbayShipToNotUsError(
             "missing_ship_to_control",
             detail=f"selector={SHIP_TO_CONTAINER_SELECTOR}",
@@ -1350,10 +1369,43 @@ def warm_up_session(page: Page) -> None:
         raise
 
 
+_CHROMIUM_PROBE_CODE = """
+import os
+from playwright.sync_api import sync_playwright
+kwargs = {
+    "headless": True,
+    "args": ["--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+}
+if any(os.environ.get(name) for name in ("RENDER", "RENDER_SERVICE_ID", "K_SERVICE")):
+    kwargs["chromium_sandbox"] = False
+with sync_playwright() as playwright:
+    browser = playwright.chromium.launch(**kwargs)
+    browser.close()
+"""
+
+
+def _probe_playwright_chromium() -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            [sys.executable, "-c", _CHROMIUM_PROBE_CODE],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            exc.args or [],
+            1,
+            (exc.stdout or "") if isinstance(exc.stdout, str) else "",
+            f"chromium probe timed out: {exc}",
+        )
+
+
 def ensure_playwright_chromium_installed() -> None:
     """
     Ensure Playwright Chromium browser exists in environments without shell access.
     Set SKIP_PLAYWRIGHT_INSTALL=1 to disable this bootstrap step.
+    Probe runs in a subprocess so it is safe inside FastAPI's asyncio loop.
     """
     global _PLAYWRIGHT_CHROMIUM_READY
     if os.getenv("SKIP_PLAYWRIGHT_INSTALL", "").strip().lower() in {"1", "true", "yes"}:
@@ -1367,38 +1419,21 @@ def ensure_playwright_chromium_installed() -> None:
         if _PLAYWRIGHT_CHROMIUM_READY:
             return
 
-        try:
-            from playwright.sync_api import sync_playwright as _sync_playwright
-        except Exception as exc:
-            print(f"GEEFLIP: Playwright package not available yet: {exc}", flush=True)
-            print(
-                "GEEFLIP: Install dependencies first (requirements.txt includes playwright).",
-                flush=True,
-            )
-            return
-
-        def probe() -> None:
-            with _sync_playwright() as playwright:
-                kwargs = {"headless": True, "args": BROWSER_ARGS}
-                if is_production():
-                    kwargs["chromium_sandbox"] = False
-                browser = playwright.chromium.launch(**kwargs)
-                browser.close()
-
-        try:
-            probe()
+        probe = _probe_playwright_chromium()
+        if probe.returncode == 0:
             print("GEEFLIP: Playwright Chromium already installed.", flush=True)
             _PLAYWRIGHT_CHROMIUM_READY = True
             return
-        except Exception as exc:
-            print(
-                f"GEEFLIP: Playwright Chromium missing/unusable ({exc}); installing...",
-                flush=True,
-            )
+
+        detail = (probe.stderr or probe.stdout or "chromium launch failed").strip()
+        print(
+            f"GEEFLIP: Playwright Chromium missing/unusable ({detail}); installing...",
+            flush=True,
+        )
 
         cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if proc.stdout:
                 print(proc.stdout, flush=True)
             if proc.returncode != 0:
@@ -1414,12 +1449,13 @@ def ensure_playwright_chromium_installed() -> None:
             print(f"GEEFLIP: Failed to run Playwright install command: {exc}", flush=True)
             return
 
-        try:
-            probe()
+        probe = _probe_playwright_chromium()
+        if probe.returncode == 0:
             print("GEEFLIP: Playwright Chromium is ready.", flush=True)
             _PLAYWRIGHT_CHROMIUM_READY = True
-        except Exception as exc:
-            print(f"GEEFLIP: Chromium still unusable after install ({exc})", flush=True)
+            return
+        detail = (probe.stderr or probe.stdout or "chromium launch failed").strip()
+        print(f"GEEFLIP: Chromium still unusable after install ({detail})", flush=True)
 
 
 def _launch_chromium(playwright, *, headless: bool):
@@ -1511,6 +1547,7 @@ def browser_session(
             default_cookies_file=default_cookies_file,
         )
 
+    ensure_playwright_chromium_installed()
     with sync_playwright() as playwright:
         session = EbayBrowserSession(playwright, session_cookies, headless=headless)
         try:
