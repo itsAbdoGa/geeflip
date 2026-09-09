@@ -35,14 +35,14 @@ LINUX_BROWSER_ARGS = [
     "--disable-gpu",
     "--disable-software-rasterizer",
     "--mute-audio",
-    "--disable-background-networking",
-    "--disable-breakpad",
-    "--disable-component-update",
-    "--renderer-process-limit=2",
 ]
 BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
 BROWSER_WARMUP_ATTEMPTS = 3
+HEAVY_ASSET_RE = re.compile(
+    r".*\.(?:png|jpe?g|gif|webp|svg|avif|ico|woff2?|ttf|otf|mp4|webm)(?:\?.*)?$",
+    re.I,
+)
 
 STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -1245,10 +1245,15 @@ def create_browser_context(
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
     apply_cookies_to_context(context, cookies or [])
+    if headless:
+        context.route(HEAVY_ASSET_RE, lambda route: route.abort())
     return context
 
 
-def warm_up_session(page: Page) -> None:
+def warm_up_session(page: Page, *, headless: bool = False) -> None:
+    if headless:
+        print("Playwright: skipping eBay homepage warmup in headless mode", flush=True)
+        return
     page.goto(
         "https://www.ebay.com/",
         wait_until="domcontentloaded",
@@ -1330,30 +1335,15 @@ def ensure_playwright_chromium_installed() -> None:
             print(f"GEEFLIP: Failed to run Playwright install command: {exc}", flush=True)
             return
 
-        if os.name != "nt":
-            print(
-                "GEEFLIP: installing Playwright OS libraries "
-                "(python -m playwright install-deps chromium)",
-                flush=True,
-            )
-            deps = subprocess.run(
-                [sys.executable, "-m", "playwright", "install-deps", "chromium"],
-                capture_output=True,
-                text=True,
-            )
-            if deps.stdout:
-                print(deps.stdout, flush=True)
-            if deps.returncode != 0 and deps.stderr:
-                print(deps.stderr, flush=True)
-
         try:
             probe()
+            print("GEEFLIP: Playwright Chromium is ready.", flush=True)
             _PLAYWRIGHT_CHROMIUM_READY = True
         except Exception as exc:
             print(f"GEEFLIP: Chromium still unusable after install ({exc})", flush=True)
 
 
-def _is_target_crash(error: BaseException) -> bool:
+def is_browser_crash(error: BaseException) -> bool:
     text = str(error).casefold()
     return any(
         needle in text
@@ -1375,11 +1365,20 @@ def _chromium_launch_args(*, headless: bool) -> list[str]:
 
 
 def _launch_chromium(playwright, *, headless: bool):
-    return playwright.chromium.launch(
-        headless=headless,
-        args=_chromium_launch_args(headless=headless),
-        chromium_sandbox=False,
-    )
+    kwargs = {
+        "args": _chromium_launch_args(headless=headless),
+        "chromium_sandbox": False,
+        "handle_sigint": False,
+        "handle_sigterm": False,
+        "handle_sighup": False,
+    }
+    if headless:
+        return playwright.chromium.launch(
+            headless=True,
+            channel="chromium",
+            **kwargs,
+        )
+    return playwright.chromium.launch(headless=False, **kwargs)
 
 
 def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
@@ -1395,12 +1394,12 @@ def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = Fal
                 headless=headless,
             )
             page = context.new_page()
-            warm_up_session(page)
+            warm_up_session(page, headless=headless)
             return browser, context, page
         except Exception as error:
             last_error = error
             close_ebay_browser(browser, context)
-            if not _is_target_crash(error) or attempt >= BROWSER_WARMUP_ATTEMPTS:
+            if not is_browser_crash(error) or attempt >= BROWSER_WARMUP_ATTEMPTS:
                 raise
             print(
                 f"Browser crashed during warmup (attempt {attempt}/"

@@ -27,6 +27,7 @@ from lib.ebay_scraper import (
     format_below_buybox_listing_logs,
     format_block_log,
     format_cheapest_listing_log,
+    is_browser_crash,
     load_ebay_cookies,
     parse_price,
     refresh_and_verify_ship_to_us,
@@ -1721,6 +1722,20 @@ def main(settings: ScrapeSettings | None = None) -> int:
                         )
                         skipped_previous_ean_for_ship_to = True
                         continue
+                    except Exception as error:
+                        if not is_browser_crash(error):
+                            raise
+                        print(
+                            "  Browser crashed; restarting and retrying this search: "
+                            f"{error}"
+                        )
+                        session.restart()
+                        searches_since_browser_start = 0
+                        product_winners = process_live_product_with_ship_to_retry(
+                            session.page,
+                            product,
+                            **process_kwargs(display_index, display_total, live=True),
+                        )
 
                     skipped_previous_ean_for_ship_to = False
                     keep_winners(product_winners)
