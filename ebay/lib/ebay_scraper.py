@@ -1,6 +1,8 @@
 import os
 import re
+import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1244,12 +1246,81 @@ def warm_up_session(page: Page) -> None:
         verify_ship_to_us(page)
 
 
+_PLAYWRIGHT_CHROMIUM_LOCK = threading.Lock()
+_PLAYWRIGHT_CHROMIUM_READY = False
+
+
+def ensure_playwright_chromium_installed() -> None:
+    """Ensure Playwright Chromium exists in environments without shell access.
+
+    Set SKIP_PLAYWRIGHT_INSTALL=1 to disable this bootstrap step.
+    """
+    global _PLAYWRIGHT_CHROMIUM_READY
+    if os.getenv("SKIP_PLAYWRIGHT_INSTALL", "").strip().lower() in {"1", "true", "yes"}:
+        print(
+            "GEEFLIP: Skipping Playwright Chromium bootstrap (SKIP_PLAYWRIGHT_INSTALL=1).",
+            flush=True,
+        )
+        return
+
+    with _PLAYWRIGHT_CHROMIUM_LOCK:
+        if _PLAYWRIGHT_CHROMIUM_READY:
+            return
+
+        try:
+            from playwright.sync_api import sync_playwright as _sync_playwright
+        except Exception as exc:
+            print(f"GEEFLIP: Playwright package not available yet: {exc}", flush=True)
+            print("GEEFLIP: Install dependencies first (requirements.txt includes playwright).", flush=True)
+            return
+
+        def probe() -> None:
+            with _sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                browser.close()
+
+        try:
+            probe()
+            print("GEEFLIP: Playwright Chromium already installed.", flush=True)
+            _PLAYWRIGHT_CHROMIUM_READY = True
+            return
+        except Exception as exc:
+            print(
+                f"GEEFLIP: Playwright Chromium missing/unusable ({exc}); installing...",
+                flush=True,
+            )
+
+        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.stdout:
+                print(proc.stdout, flush=True)
+            if proc.returncode != 0:
+                if proc.stderr:
+                    print(proc.stderr, flush=True)
+                print(
+                    f"GEEFLIP: Playwright install failed with exit code {proc.returncode}.",
+                    flush=True,
+                )
+                return
+            print("GEEFLIP: Playwright Chromium installation complete.", flush=True)
+        except Exception as exc:
+            print(f"GEEFLIP: Failed to run Playwright install command: {exc}", flush=True)
+            return
+
+        try:
+            probe()
+            _PLAYWRIGHT_CHROMIUM_READY = True
+        except Exception as exc:
+            print(f"GEEFLIP: Chromium still unusable after install ({exc})", flush=True)
+
+
+def _launch_chromium(playwright, *, headless: bool):
+    return playwright.chromium.launch(headless=headless, args=BROWSER_ARGS)
+
+
 def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
-    browser = playwright.chromium.launch(
-        headless=headless,
-        channel="chrome",
-        args=BROWSER_ARGS,
-    )
+    browser = _launch_chromium(playwright, headless=headless)
     context = create_browser_context(browser, cookies=cookies)
     page = context.new_page()
     warm_up_session(page)
@@ -1314,6 +1385,7 @@ def browser_session(
             default_cookies_file=default_cookies_file,
         )
 
+    ensure_playwright_chromium_installed()
     with sync_playwright() as playwright:
         session = EbayBrowserSession(playwright, cookies, headless=headless)
         try:

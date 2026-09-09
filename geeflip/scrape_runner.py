@@ -267,6 +267,9 @@ class ScrapeRunner:
         error = None
         try:
             sys.stdout = _LogTee(stdout, self.emit, thread_id=threading.get_ident())
+            from lib.ebay_scraper import ensure_playwright_chromium_installed
+
+            ensure_playwright_chromium_installed()
             exit_code = scrape_main(settings)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

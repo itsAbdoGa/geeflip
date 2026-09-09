@@ -10,12 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 from pathlib import Path
 
 from contextlib import asynccontextmanager
 
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 GEEFLIP_ROOT = Path(__file__).resolve().parent
@@ -27,6 +28,7 @@ for path in (str(GEEFLIP_ROOT), str(EBAY_ROOT), str(PROJECT_ROOT)):
 
 from cookies import read_cookie, write_cookie, cookie_status
 from db import GeeflipStore
+from lib.ebay_scraper import ensure_playwright_chromium_installed
 from scrape_runner import ScrapeRunner, coerce_filters
 
 store = GeeflipStore()
@@ -67,31 +69,50 @@ async def lifespan(_app: FastAPI):
             f"({images.get('with_image', 0):,} products)",
             flush=True,
         )
-    print("GEEFLIP: http://127.0.0.1:8787", flush=True)
+    print("GEEFLIP: http://0.0.0.0:8787", flush=True)
+    threading.Thread(
+        target=ensure_playwright_chromium_installed,
+        name="playwright-install",
+        daemon=True,
+    ).start()
     yield
 
 
 app = FastAPI(title="GEEFLIP", lifespan=lifespan)
 
 
+def html_page(name: str) -> FileResponse:
+    return FileResponse(GEEFLIP_ROOT / "static" / name)
+
+
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / "index.html")
+    return html_page("index.html")
 
 
-@app.get("/asins")
+@app.head("/")
+def index_head() -> Response:
+    return Response(status_code=200)
+
+
+@app.api_route("/asins", methods=["GET", "HEAD"])
 def asins_page() -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / "asins.html")
+    return html_page("asins.html")
 
 
-@app.get("/history")
+@app.api_route("/history", methods=["GET", "HEAD"])
 def history_page() -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / "history.html")
+    return html_page("history.html")
 
 
-@app.get("/admin")
+@app.api_route("/admin", methods=["GET", "HEAD"])
 def admin_page() -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / "admin.html")
+    return html_page("admin.html")
+
+
+@app.api_route("/favicon.ico", methods=["GET", "HEAD"])
+def favicon() -> Response:
+    return Response(status_code=204)
 
 
 @app.get("/api/status")
