@@ -102,8 +102,20 @@ function setStatus(snapshot) {
     snapshot.winners_run ?? 0
   ).toLocaleString();
   const cookiePill = document.getElementById("cookie-pill");
-  cookiePill.textContent = "guest session";
-  cookiePill.classList.remove("missing");
+  const modePill = document.getElementById("mode-pill");
+  if (modePill && snapshot.playwright) {
+    const mode = String(snapshot.playwright);
+    modePill.textContent = mode.includes("requests")
+      ? "requests · session"
+      : "Playwright · headless";
+  }
+  if (snapshot.cookie_mode === "requests" || snapshot.playwright?.includes?.("requests")) {
+    cookiePill.textContent = snapshot.cookies ? "cookies + requests" : "requests session";
+    cookiePill.classList.toggle("missing", !snapshot.cookies);
+  } else {
+    cookiePill.textContent = snapshot.cookies ? "cookies loaded" : "no cookies";
+    cookiePill.classList.toggle("missing", !snapshot.cookies);
+  }
 }
 
 function renderWinners(payload) {

@@ -1,3 +1,5 @@
+import gc
+import json
 import os
 import re
 import subprocess
@@ -14,35 +16,87 @@ from typing import Iterator
 from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 from selectolax.parser import HTMLParser
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+EBAY_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = EBAY_ROOT.parent
+for _path in (str(EBAY_ROOT), str(PROJECT_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 import image_search
+from lib.paths import PLAYWRIGHT_STORAGE_STATE, ensure_data_dirs
 
 PAGE_TIMEOUT_MS = 25_000
 RESULTS_SELECTOR_TIMEOUT_MS = 4_000
 VISUAL_SEARCH_RESULTS_TIMEOUT_MS = 8_000
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
 
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-dev-shm-usage",
     "--disable-infobars",
     "--window-position=0,0",
+    "--window-size=900,600",
     "--ignore-certificate-errors",
+    "--mute-audio",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--disable-component-update",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-breakpad",
+    "--disable-client-side-phishing-detection",
+    "--disable-default-apps",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-sync",
+    "--disable-translate",
+    "--disable-notifications",
+    "--disable-renderer-backgrounding",
+    "--disable-ipc-flooding-protection",
+    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,AudioServiceOutOfProcess,IsolateOrigins,site-per-process",
+    "--disable-site-isolation-trials",
+    "--enable-low-end-device-mode",
+    "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=384",
+    "--disk-cache-size=1",
+    "--media-cache-size=1",
+    "--hide-scrollbars",
+    "--autoplay-policy=user-gesture-required",
 ]
 LINUX_BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
-    "--mute-audio",
 ]
-BROWSER_RESTART_EVERY = 1000
-BROWSER_RESTART_PAUSE_SECONDS = 1.5
+HEADLESS_BROWSER_ARGS = [
+    "--disable-gpu",
+]
+BROWSER_RESTART_EVERY = _env_int("GEEFLIP_BROWSER_RESTART_EVERY", 25)
+BROWSER_RESTART_PAUSE_SECONDS = 2.0
 BROWSER_WARMUP_ATTEMPTS = 3
 CHALLENGE_WAIT_TIMEOUT_MS = 8_000
 PRODUCTION_SEARCH_PAUSE_SECONDS = 2.0
-DOM_PRINT_CHARS = 80_000
+DOM_PRINT_CHARS = 4_000
 HEAVY_ASSET_RE = re.compile(
     r".*\.(?:png|jpe?g|gif|webp|svg|avif|ico|woff2?|ttf|otf|mp4|webm)(?:\?.*)?$",
+    re.I,
+)
+BLOCKED_RESOURCE_TYPES = frozenset(
+    {"image", "media", "font", "ping", "manifest", "texttrack"}
+)
+TRACKER_HOST_RE = re.compile(
+    r"(google-analytics|googletagmanager|doubleclick|facebook\.net|"
+    r"hotjar|sentry\.io|clarity\.ms|adservice\.google)",
     re.I,
 )
 _PLAYWRIGHT_CHROMIUM_LOCK = threading.Lock()
@@ -881,9 +935,23 @@ def is_browser_crash(error: BaseException) -> bool:
     )
 
 
+def is_playwright_page(page) -> bool:
+    return bool(
+        page is not None
+        and hasattr(page, "goto")
+        and hasattr(page, "content")
+        and hasattr(page, "wait_for_selector")
+    )
+
+
 def is_recoverable_browser_error(error: BaseException) -> bool:
+    from lib.ebay_http import EbayHttpError, is_recoverable_http_error
+
     if is_browser_crash(error):
         return True
+    if isinstance(error, EbayHttpError) or use_ebay_http():
+        if is_recoverable_http_error(error):
+            return True
     text = str(error).casefold()
     return (
         isinstance(error, EbayBlockedError)
@@ -929,6 +997,12 @@ def log_page_debug(
     url: str = "",
     page: Page | None = None,
 ) -> None:
+    from lib.ebay_http import EbayHttpSession
+
+    if isinstance(page, EbayHttpSession):
+        url = page.last_url or url
+        html = html or page.last_html
+        page = None
     if page is not None:
         try:
             url = page.url or url
@@ -1235,7 +1309,14 @@ def fill_missing_seller_reviews(
             continue
         if url not in cache:
             print(f"  Looking up seller reviews on listing page")
-            cache[url] = fetch_listing_seller_details(page, url)
+            from lib.ebay_http import EbayHttpSession
+
+            if isinstance(page, EbayHttpSession):
+                cache[url] = extract_seller_from_listing_html(
+                    page.fetch_html(url).html
+                )
+            else:
+                cache[url] = fetch_listing_seller_details(page, url)
         seller_name, seller_reviews = cache[url]
         if seller_name:
             listing["seller_name"] = seller_name
@@ -1275,7 +1356,13 @@ def extract_amazon_sales_rank(html: str) -> int | None:
     return None
 
 
-def fetch_amazon_sales_rank(page: Page, url: str) -> int | None:
+def fetch_amazon_sales_rank(page, url: str) -> int | None:
+    from lib.ebay_http import EbayHttpSession
+
+    if isinstance(page, EbayHttpSession):
+        fetched = page.fetch_html(url, referer="https://www.amazon.com/")
+        return extract_amazon_sales_rank(fetched.html)
+
     page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     try:
@@ -1343,15 +1430,18 @@ def is_production() -> bool:
     return env in {"prod", "production"}
 
 
+def use_ebay_http() -> bool:
+    """Optional requests scraper. Production and local both use Playwright by default."""
+    override = os.environ.get("GEEFLIP_EBAY_HTTP", "").strip().lower()
+    return override in {"1", "true", "yes", "on"}
+
+
 def load_ebay_cookies(
     *,
     cookie_header: str | None = None,
     cookies_file: Path | None = None,
     default_cookies_file: Path | None = None,
 ) -> list[dict]:
-    if is_production():
-        return []
-
     header = (cookie_header or "").strip()
 
     if not header and cookies_file is not None and cookies_file.exists():
@@ -1383,6 +1473,56 @@ def describe_ebay_cookie_session(cookies: list[dict]) -> str:
 def apply_cookies_to_context(context, cookies: list[dict]) -> None:
     if cookies:
         context.add_cookies(cookies)
+
+
+def playwright_storage_state_path() -> Path:
+    ensure_data_dirs()
+    return PLAYWRIGHT_STORAGE_STATE
+
+
+def existing_playwright_storage_state() -> str | None:
+    path = playwright_storage_state_path()
+    if path.is_file() and path.stat().st_size > 2:
+        return str(path)
+    return None
+
+
+def describe_playwright_storage_state(path: Path | str | None = None) -> str:
+    state_path = Path(path) if path else playwright_storage_state_path()
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        cookies = payload.get("cookies") or []
+        names = sorted(
+            {
+                str(cookie.get("name") or "")
+                for cookie in cookies
+                if cookie.get("name")
+            }
+        )
+        if not names:
+            return f"{len(cookies)} cookies"
+        preview = ", ".join(names[:8])
+        extra = f" +{len(names) - 8} more" if len(names) > 8 else ""
+        return f"{len(cookies)} cookies ({preview}{extra})"
+    except Exception:
+        return "saved Playwright session"
+
+
+def save_playwright_storage_state(context) -> None:
+    if context is None:
+        return
+    path = playwright_storage_state_path()
+    try:
+        context.storage_state(path=str(path))
+        print(
+            f"Playwright eBay session saved: {describe_playwright_storage_state(path)}",
+            flush=True,
+        )
+    except Exception as error:
+        print(
+            f"Could not persist Playwright session: {type(error).__name__}: {error}",
+            flush=True,
+        )
 
 
 def is_ebay_challenge_url(url: str) -> bool:
@@ -1458,6 +1598,15 @@ def homepage_loaded_successfully(snapshot: dict[str, str]) -> bool:
     return "ebay" in title or snapshot.get("ebay_header") == "yes"
 
 
+def debug_dom_enabled() -> bool:
+    return os.getenv("GEEFLIP_DEBUG_DOM", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def print_page_dom(page: Page | None, *, label: str) -> dict[str, str]:
     snapshot = _page_snapshot(page)
     print(f"----- DOM {label} -----", flush=True)
@@ -1473,6 +1622,14 @@ def print_page_dom(page: Page | None, *, label: str) -> dict[str, str]:
         f"html_bytes={snapshot['bytes']}",
         flush=True,
     )
+    if not debug_dom_enabled():
+        print(
+            f"body DOM omitted (set GEEFLIP_DEBUG_DOM=1 to dump). "
+            f"{snapshot['bytes']} html bytes",
+            flush=True,
+        )
+        print(f"----- end DOM {label} -----", flush=True)
+        return snapshot
     body_html = snapshot["body_html"]
     if len(body_html) > DOM_PRINT_CHARS:
         print(
@@ -1568,27 +1725,50 @@ def create_browser_context(
     *,
     cookies: list[dict] | None = None,
     headless: bool = False,
+    storage_state: str | Path | None = None,
 ):
-    compact = headless or is_production()
-    context = browser.new_context(
-        locale="en-US",
-        timezone_id="America/New_York",
-        viewport={"width": 1024, "height": 720} if compact else {"width": 1440, "height": 900},
-    )
+    context_kwargs = {
+        "locale": "en-US",
+        "timezone_id": "America/New_York",
+        "viewport": {"width": 900, "height": 600},
+        "device_scale_factor": 1,
+        "reduced_motion": "reduce",
+        "service_workers": "block",
+    }
+    if storage_state:
+        context_kwargs["storage_state"] = str(storage_state)
+    try:
+        context = browser.new_context(**context_kwargs)
+    except Exception as error:
+        if not storage_state:
+            raise
+        print(
+            f"Saved Playwright session could not be loaded ({error}); starting a fresh session",
+            flush=True,
+        )
+        context_kwargs.pop("storage_state", None)
+        context = browser.new_context(**context_kwargs)
     context.add_init_script(STEALTH_INIT_SCRIPT)
     apply_cookies_to_context(context, cookies or [])
-    if compact:
-        def _maybe_abort_heavy(route) -> None:
-            url = route.request.url.casefold()
-            if "splashui" in url or "challenge" in url:
-                route.continue_()
-                return
-            if HEAVY_ASSET_RE.search(route.request.url):
-                route.abort()
-                return
-            route.continue_()
 
-        context.route(HEAVY_ASSET_RE, _maybe_abort_heavy)
+    def _maybe_abort_heavy(route) -> None:
+        url = route.request.url
+        lowered = url.casefold()
+        if "splashui" in lowered or "challenge" in lowered:
+            route.continue_()
+            return
+        if TRACKER_HOST_RE.search(url):
+            route.abort()
+            return
+        if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+            route.abort()
+            return
+        if HEAVY_ASSET_RE.search(url):
+            route.abort()
+            return
+        route.continue_()
+
+    context.route("**/*", _maybe_abort_heavy)
     return context
 
 
@@ -1605,7 +1785,7 @@ def warm_up_session(page: Page) -> None:
                 f"(url={snapshot['url']!r} title={snapshot['title']!r})",
                 flush=True,
             )
-        time.sleep(2)
+        time.sleep(0.6)
         if is_production():
             print("Production scrape: skipping ship-to US check", flush=True)
             return
@@ -1718,8 +1898,9 @@ def ensure_playwright_chromium_installed() -> None:
 
 def _chromium_launch_args(*, headless: bool) -> list[str]:
     args = list(BROWSER_ARGS)
-    if headless or is_production() or os.name != "nt":
-        args.extend(LINUX_BROWSER_ARGS)
+    args.extend(LINUX_BROWSER_ARGS)
+    if headless or is_production():
+        args.extend(HEADLESS_BROWSER_ARGS)
     return args
 
 
@@ -1730,22 +1911,23 @@ def _launch_chromium(playwright, *, headless: bool):
         "handle_sigint": False,
         "handle_sigterm": False,
         "handle_sighup": False,
+        "chromium_sandbox": False,
     }
-    if is_production() or headless:
-        kwargs["chromium_sandbox"] = False
-    if is_production():
-        return playwright.chromium.launch(**kwargs)
-    try:
-        return playwright.chromium.launch(channel="chrome", **kwargs)
-    except Exception as error:
-        print(
-            f"GEEFLIP: system Chrome unavailable ({error}); using Playwright Chromium",
-            flush=True,
-        )
-        return playwright.chromium.launch(**kwargs)
+    print(
+        "GEEFLIP: launching compact Playwright Chromium "
+        f"(headless={headless}, restart every {BROWSER_RESTART_EVERY} searches)",
+        flush=True,
+    )
+    return playwright.chromium.launch(**kwargs)
 
 
-def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
+def launch_ebay_browser(
+    playwright,
+    cookies: list[dict],
+    *,
+    headless: bool = False,
+    storage_state: str | Path | None = None,
+):
     ensure_playwright_chromium_installed()
     last_error = None
     for attempt in range(1, BROWSER_WARMUP_ATTEMPTS + 1):
@@ -1757,6 +1939,7 @@ def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = Fal
                 browser,
                 cookies=cookies,
                 headless=headless,
+                storage_state=storage_state,
             )
             page = context.new_page()
             warm_up_session(page)
@@ -1789,23 +1972,54 @@ def close_ebay_browser(browser, context) -> None:
 
 
 class EbayBrowserSession:
-    def __init__(self, playwright, cookies: list[dict], *, headless: bool = False):
+    def __init__(
+        self,
+        playwright,
+        cookies: list[dict],
+        *,
+        headless: bool = False,
+        persist_session: bool = False,
+    ):
         self._playwright = playwright
         self._cookies = cookies
         self._headless = headless
+        self._persist_session = persist_session
         self.browser = None
         self.context = None
         self.page = None
         self.start()
 
+    def _storage_state_to_restore(self) -> str | None:
+        if not self._persist_session:
+            return None
+        return existing_playwright_storage_state()
+
     def start(self) -> None:
+        storage_state = self._storage_state_to_restore()
+        if storage_state:
+            print(
+                "Restoring Playwright eBay session: "
+                f"{describe_playwright_storage_state(storage_state)}",
+                flush=True,
+            )
+        else:
+            print(
+                "Starting a fresh Playwright eBay session "
+                "(Chromium will keep cookies eBay sets)",
+                flush=True,
+            )
         self.browser, self.context, self.page = launch_ebay_browser(
             self._playwright,
             self._cookies,
             headless=self._headless,
+            storage_state=storage_state,
         )
+        if self._persist_session:
+            save_playwright_storage_state(self.context)
 
     def close(self) -> None:
+        if self._persist_session:
+            save_playwright_storage_state(self.context)
         close_ebay_browser(self.browser, self.context)
         self.browser = None
         self.context = None
@@ -1813,6 +2027,7 @@ class EbayBrowserSession:
 
     def restart(self) -> None:
         self.close()
+        gc.collect()
         time.sleep(BROWSER_RESTART_PAUSE_SECONDS)
         self.start()
 
@@ -1826,9 +2041,7 @@ def browser_session(
     default_cookies_file: Path | None = None,
     headless: bool = False,
 ) -> Iterator[EbayBrowserSession]:
-    if is_production():
-        session_cookies: list[dict] = []
-    elif cookies is not None:
+    if cookies is not None:
         session_cookies = cookies
     else:
         session_cookies = load_ebay_cookies(
@@ -1836,10 +2049,16 @@ def browser_session(
             cookies_file=cookies_file,
             default_cookies_file=default_cookies_file,
         )
+    persist_session = is_production()
 
     ensure_playwright_chromium_installed()
     with sync_playwright() as playwright:
-        session = EbayBrowserSession(playwright, session_cookies, headless=headless)
+        session = EbayBrowserSession(
+            playwright,
+            session_cookies,
+            headless=headless,
+            persist_session=persist_session,
+        )
         try:
             yield session
         finally:
@@ -2008,7 +2227,7 @@ def scrape_image_search_page(
 
 
 def scrape_search_page(
-    page: Page,
+    page,
     url: str,
     *,
     title: str = "",
@@ -2016,17 +2235,46 @@ def scrape_search_page(
     ean: str = "",
     buybox_price: str = "",
 ) -> dict:
+    from lib.ebay_http import EbayHttpError, EbayHttpSession
+
     result = _empty_search_result(
         url, title=title, asin=asin, ean=ean, buybox_price=buybox_price
     )
     try:
-        fetch_result = fetch_search_page(page, url)
+        if isinstance(page, EbayHttpSession):
+            fetched = page.fetch_search(url)
+            fetch_result = PageFetchResult(
+                url=fetched.url,
+                final_url=fetched.final_url,
+                status_code=fetched.status_code,
+                html=fetched.html,
+            )
+            assert_ship_to_us_html(fetch_result.html)
+            analyze_page(url, fetch_result)
+        else:
+            fetch_result = fetch_search_page(page, url)
         return _fill_search_result(
             result,
             fetch_result.html,
             final_url=fetch_result.final_url,
             status_code=fetch_result.status_code,
         )
+    except EbayHttpError as error:
+        log_page_debug(
+            reason="search page failed",
+            error=error,
+            html=error.html,
+            url=error.final_url or url,
+            page=page,
+        )
+        raise EbayBlockedError(
+            url=url,
+            status_code=error.status_code,
+            final_url=error.final_url or url,
+            content_length=len(error.html.encode("utf-8", errors="replace")),
+            reason=str(error),
+            body_preview=error.html[:BODY_PREVIEW_CHARS],
+        ) from error
     except Exception as error:
         if not is_recoverable_browser_error(error):
             log_page_debug(reason="search page failed", error=error, page=page)

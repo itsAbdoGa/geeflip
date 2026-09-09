@@ -23,10 +23,10 @@ def read_cookie() -> str:
 def write_cookie(text: str) -> Path:
     cleaned = text.strip()
     COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    EBAY_COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = f"{cleaned}\n" if cleaned else ""
     COOKIE_FILE.write_text(payload, encoding="utf-8")
-    if EBAY_COOKIE_FILE.parent.exists():
-        EBAY_COOKIE_FILE.write_text(payload, encoding="utf-8")
+    EBAY_COOKIE_FILE.write_text(payload, encoding="utf-8")
     return COOKIE_FILE
 
 

@@ -29,6 +29,7 @@ from lib.ebay_scraper import (
     format_below_buybox_listing_logs,
     format_block_log,
     format_cheapest_listing_log,
+    is_playwright_page,
     is_production,
     is_recoverable_browser_error,
     load_ebay_cookies,
@@ -38,7 +39,9 @@ from lib.ebay_scraper import (
     scrape_image_search_page,
     scrape_search_page,
     scrape_search_page_from_html,
+    use_ebay_http,
 )
+from lib.ebay_http import EbayHttpSession
 from lib.paths import (
     COMBINED_XLSX,
     EBAY_COOKIES_FILE,
@@ -109,7 +112,7 @@ class ScrapeSettings:
     cookies_file: Path | None = EBAY_COOKIES_FILE
     cookie_header: str | None = None
 
-    headless: bool = False
+    headless: bool = True
     write_xlsx: bool = True
     write_json: bool = True
     should_stop: Callable[[], bool] | None = None
@@ -1358,7 +1361,7 @@ def process_product(
     if (
         settings.image_search
         and saved_html is None
-        and page is not None
+        and is_playwright_page(page)
         and query_type in {"EAN", "UPC"}
         and result.get("listings")
         and not result.get("block_reason")
@@ -1379,6 +1382,14 @@ def process_product(
         except Exception as error:
             log_page_debug(reason="image search failed", error=error, page=page)
             raise
+    elif (
+        settings.image_search
+        and saved_html is None
+        and not is_playwright_page(page)
+        and query_type in {"EAN", "UPC"}
+        and result.get("listings")
+    ):
+        print("  Skipping image search: production HTTP scraper has no browser UI")
 
     return product_winners
 
@@ -1665,88 +1676,158 @@ def main(settings: ScrapeSettings | None = None) -> int:
                     )
                 )
         else:
-            cookies = load_ebay_cookies(
-                cookie_header=settings.cookie_header,
-                cookies_file=settings.cookies_file,
-                default_cookies_file=EBAY_COOKIES_FILE,
-            )
-            mode_label = "headless" if settings.headless else "headed"
-            print(f"Scraping {total} eBay search URLs with Playwright ({mode_label})")
-            if is_production():
-                print("eBay session: guest (production, cookies disabled)")
-            else:
+            if use_ebay_http():
+                cookies = load_ebay_cookies(
+                    cookie_header=settings.cookie_header,
+                    cookies_file=settings.cookies_file,
+                    default_cookies_file=EBAY_COOKIES_FILE,
+                )
+                print(
+                    "Scraping eBay search URLs with requests "
+                    "(homepage warmup + proxy)"
+                )
                 print(f"eBay session: {describe_ebay_cookie_session(cookies)}")
-            if BROWSER_RESTART_EVERY:
-                print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
-            with browser_session(cookies=cookies, headless=settings.headless) as session:
-                searches_since_browser_start = 0
-                for index, product in enumerate(products, start=1):
-                    if requested_stop():
-                        stop_reason = "stopped from website"
-                        break
-                    current_product = product
-                    if (
-                        BROWSER_RESTART_EVERY
-                        and searches_since_browser_start >= BROWSER_RESTART_EVERY
-                    ):
-                        print(
-                            f"Restarting browser after {index - 1} searches "
-                            "to free memory"
-                        )
-                        session.restart()
-                        searches_since_browser_start = 0
-                    searches_since_browser_start += 1
-                    display_index = int(product.get("selection_position", index))
-                    display_total = int(product.get("selection_total", total))
-                    query_type = str(
-                        product.get("search_identifier_type") or ""
-                    ).upper()
-                    query_key = identifier_query_key(
-                        query_type,
-                        product.get("search_identifier"),
-                    )
-                    if (
-                        query_type in {"EAN", "UPC"}
-                        and query_key in identifier_no_match_keys
-                    ):
-                        print(
-                            f"[{display_index}/{display_total}] Skipping "
-                            f"{query_type} {product.get('search_identifier')}: "
-                            "recently had no exact matches"
-                        )
-                        continue
-                    crash_retries = 0
-                    while True:
-                        try:
-                            product_winners = process_live_product_with_ship_to_retry(
-                                session.page,
-                                product,
-                                **process_kwargs(display_index, display_total, live=True),
-                            )
+                with EbayHttpSession(cookies=cookies) as http:
+                    for index, product in enumerate(products, start=1):
+                        if requested_stop():
+                            stop_reason = "stopped from website"
                             break
-                        except Exception as error:
-                            if (
-                                not is_recoverable_browser_error(error)
-                                or crash_retries >= 2
-                            ):
-                                if not is_recoverable_browser_error(error):
-                                    log_page_debug(
-                                        reason="scrape failed",
-                                        error=error,
-                                        page=session.page,
-                                    )
-                                raise
-                            crash_retries += 1
+                        current_product = product
+                        display_index = int(product.get("selection_position", index))
+                        display_total = int(product.get("selection_total", total))
+                        query_type = str(
+                            product.get("search_identifier_type") or ""
+                        ).upper()
+                        query_key = identifier_query_key(
+                            query_type,
+                            product.get("search_identifier"),
+                        )
+                        if (
+                            query_type in {"EAN", "UPC"}
+                            and query_key in identifier_no_match_keys
+                        ):
                             print(
-                                "  Bot-check or browser crash; restarting, warming up "
-                                f"ebay.com, and retrying ({crash_retries}/2): {error}",
-                                flush=True,
+                                f"[{display_index}/{display_total}] Skipping "
+                                f"{query_type} {product.get('search_identifier')}: "
+                                "recently had no exact matches"
+                            )
+                            continue
+                        crash_retries = 0
+                        while True:
+                            try:
+                                product_winners = process_live_product_with_ship_to_retry(
+                                    http,
+                                    product,
+                                    **process_kwargs(
+                                        display_index, display_total, live=True
+                                    ),
+                                )
+                                break
+                            except Exception as error:
+                                if (
+                                    not is_recoverable_browser_error(error)
+                                    or crash_retries >= 2
+                                ):
+                                    if not is_recoverable_browser_error(error):
+                                        log_page_debug(
+                                            reason="scrape failed",
+                                            error=error,
+                                            page=http,
+                                        )
+                                    raise
+                                crash_retries += 1
+                                print(
+                                    "  Challenge or timeout; resetting HTTP session "
+                                    f"and retrying ({crash_retries}/2): {error}",
+                                    flush=True,
+                                )
+                                http.reset()
+                        keep_winners(product_winners)
+                        time.sleep(PRODUCTION_SEARCH_PAUSE_SECONDS)
+            else:
+                cookies = load_ebay_cookies(
+                    cookie_header=settings.cookie_header,
+                    cookies_file=settings.cookies_file,
+                    default_cookies_file=EBAY_COOKIES_FILE,
+                )
+                mode_label = "headless" if settings.headless else "headed"
+                print(f"Scraping {total} eBay search URLs with Playwright ({mode_label})")
+                print(
+                    "Low-end mode: compact Chromium, images/fonts blocked, "
+                    f"browser restart every {BROWSER_RESTART_EVERY} searches"
+                )
+                print(f"eBay session: {describe_ebay_cookie_session(cookies)}")
+                if BROWSER_RESTART_EVERY:
+                    print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
+                with browser_session(cookies=cookies, headless=settings.headless) as session:
+                    searches_since_browser_start = 0
+                    for index, product in enumerate(products, start=1):
+                        if requested_stop():
+                            stop_reason = "stopped from website"
+                            break
+                        current_product = product
+                        if (
+                            BROWSER_RESTART_EVERY
+                            and searches_since_browser_start >= BROWSER_RESTART_EVERY
+                        ):
+                            print(
+                                f"Restarting browser after {index - 1} searches "
+                                "to free memory"
                             )
                             session.restart()
                             searches_since_browser_start = 0
-                    keep_winners(product_winners)
-                    if is_production():
-                        time.sleep(PRODUCTION_SEARCH_PAUSE_SECONDS)
+                        searches_since_browser_start += 1
+                        display_index = int(product.get("selection_position", index))
+                        display_total = int(product.get("selection_total", total))
+                        query_type = str(
+                            product.get("search_identifier_type") or ""
+                        ).upper()
+                        query_key = identifier_query_key(
+                            query_type,
+                            product.get("search_identifier"),
+                        )
+                        if (
+                            query_type in {"EAN", "UPC"}
+                            and query_key in identifier_no_match_keys
+                        ):
+                            print(
+                                f"[{display_index}/{display_total}] Skipping "
+                                f"{query_type} {product.get('search_identifier')}: "
+                                "recently had no exact matches"
+                            )
+                            continue
+                        crash_retries = 0
+                        while True:
+                            try:
+                                product_winners = process_live_product_with_ship_to_retry(
+                                    session.page,
+                                    product,
+                                    **process_kwargs(display_index, display_total, live=True),
+                                )
+                                break
+                            except Exception as error:
+                                if (
+                                    not is_recoverable_browser_error(error)
+                                    or crash_retries >= 2
+                                ):
+                                    if not is_recoverable_browser_error(error):
+                                        log_page_debug(
+                                            reason="scrape failed",
+                                            error=error,
+                                            page=session.page,
+                                        )
+                                    raise
+                                crash_retries += 1
+                                print(
+                                    "  Bot-check or browser crash; restarting, warming up "
+                                    f"ebay.com, and retrying ({crash_retries}/2): {error}",
+                                    flush=True,
+                                )
+                                session.restart()
+                                searches_since_browser_start = 0
+                        keep_winners(product_winners)
+                        if is_production():
+                            time.sleep(PRODUCTION_SEARCH_PAUSE_SECONDS)
         if stop_reason:
             print("Scrape stopped from the website; saving winners collected so far")
             log_current_stop(stop_reason)

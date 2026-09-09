@@ -13,7 +13,7 @@ EBAY_ROOT = PROJECT_ROOT / "ebay"
 if str(EBAY_ROOT) not in sys.path:
     sys.path.insert(0, str(EBAY_ROOT))
 
-from lib.ebay_scraper import ensure_playwright_chromium_installed, is_production
+from lib.ebay_scraper import ensure_playwright_chromium_installed, is_production, use_ebay_http
 from lib.paths import COMBINED_XLSX
 from scripts.scrape_listings import ScrapeSettings, main as scrape_main, select_products
 
@@ -150,7 +150,7 @@ def settings_from_filters(
         skip_previously_won=data["skip_previously_won"],
         winner_history_retention_days=data["winner_history_retention_days"],
         identifier_no_match_retention_days=data["identifier_no_match_retention_days"],
-        cookies_file=None if is_production() else COOKIE_FILE,
+        cookies_file=COOKIE_FILE,
         headless=True,
         write_xlsx=False,
         write_json=False,
@@ -171,14 +171,18 @@ class ScrapeRunner:
         self.error: str | None = None
         self.started_at: str | None = None
         self.finished_at: str | None = None
-        self.logs: deque[dict[str, Any]] = deque(maxlen=5000)
+        self.logs: deque[dict[str, Any]] = deque(maxlen=800)
         self.log_id = 0
 
     @property
     def running(self) -> bool:
         return self.status in {"running", "stopping"}
 
+    MAX_LOG_CHARS = 1500
+
     def emit(self, line: str) -> None:
+        if len(line) > self.MAX_LOG_CHARS:
+            line = line[: self.MAX_LOG_CHARS] + "…"
         with self._lock:
             self.log_id += 1
             item = {
@@ -205,9 +209,14 @@ class ScrapeRunner:
             "error": self.error,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
-            "playwright": "headless",
+            "playwright": "requests · session" if use_ebay_http() else "headless",
             "production": is_production(),
-            "cookies": False if is_production() else cookie_status()["present"],
+            "cookies": cookie_status()["present"],
+            "cookie_mode": (
+                "requests"
+                if use_ebay_http()
+                else ("local" if cookie_status()["present"] else "none")
+            ),
             "catalog": catalog,
             "winners_total": self.store.winner_count(),
             "winners_run": self.store.winner_count(run_id=run_id) if run_id else 0,
@@ -245,7 +254,10 @@ class ScrapeRunner:
         self.started_at = datetime.now().isoformat(timespec="seconds")
         self.run_id = self.store.begin_run(coerce_filters(filters))
         self.status = "running"
-        self.emit(f"GEEFLIP scrape #{self.run_id} starting (Playwright headless)")
+        self.emit(
+            f"GEEFLIP scrape #{self.run_id} starting "
+            f"({'requests session' if use_ebay_http() else 'Playwright headless'})"
+        )
         self._thread = threading.Thread(
             target=self._run,
             args=(settings,),
@@ -269,7 +281,8 @@ class ScrapeRunner:
         error = None
         try:
             sys.stdout = _LogTee(stdout, self.emit, thread_id=threading.get_ident())
-            ensure_playwright_chromium_installed()
+            if not use_ebay_http():
+                ensure_playwright_chromium_installed()
             exit_code = scrape_main(settings)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

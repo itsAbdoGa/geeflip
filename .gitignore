@@ -4,6 +4,8 @@
 # Session cookies stay on this machine only
 ebay/data/input/ebay_cookies.txt
 geeflip/data/ebay_cookies.txt
+ebay/data/input/playwright_storage_state.json
+ebay/data/input/requests_cookies.json
 
 # Captured page dumps from scrape errors
 ebay/data/input/ebay_source.html
