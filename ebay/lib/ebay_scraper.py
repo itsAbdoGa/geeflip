@@ -29,8 +29,20 @@ BROWSER_ARGS = [
     "--window-position=0,0",
     "--ignore-certificate-errors",
 ]
+LINUX_BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--mute-audio",
+    "--disable-background-networking",
+    "--disable-breakpad",
+    "--disable-component-update",
+    "--renderer-process-limit=2",
+]
 BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
+BROWSER_WARMUP_ATTEMPTS = 3
 
 STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -1215,11 +1227,21 @@ def apply_cookies_to_context(context, cookies: list[dict]) -> None:
         context.add_cookies(cookies)
 
 
-def create_browser_context(browser: Browser, *, cookies: list[dict] | None = None):
+def create_browser_context(
+    browser: Browser,
+    *,
+    cookies: list[dict] | None = None,
+    headless: bool = False,
+):
+    viewport = (
+        {"width": 1024, "height": 720}
+        if headless
+        else {"width": 1440, "height": 900}
+    )
     context = browser.new_context(
         locale="en-US",
         timezone_id="America/New_York",
-        viewport={"width": 1440, "height": 900},
+        viewport=viewport,
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
     apply_cookies_to_context(context, cookies or [])
@@ -1276,7 +1298,7 @@ def ensure_playwright_chromium_installed() -> None:
 
         def probe() -> None:
             with _sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
+                browser = _launch_chromium(playwright, headless=True)
                 browser.close()
 
         try:
@@ -1308,6 +1330,22 @@ def ensure_playwright_chromium_installed() -> None:
             print(f"GEEFLIP: Failed to run Playwright install command: {exc}", flush=True)
             return
 
+        if os.name != "nt":
+            print(
+                "GEEFLIP: installing Playwright OS libraries "
+                "(python -m playwright install-deps chromium)",
+                flush=True,
+            )
+            deps = subprocess.run(
+                [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                capture_output=True,
+                text=True,
+            )
+            if deps.stdout:
+                print(deps.stdout, flush=True)
+            if deps.returncode != 0 and deps.stderr:
+                print(deps.stderr, flush=True)
+
         try:
             probe()
             _PLAYWRIGHT_CHROMIUM_READY = True
@@ -1315,16 +1353,62 @@ def ensure_playwright_chromium_installed() -> None:
             print(f"GEEFLIP: Chromium still unusable after install ({exc})", flush=True)
 
 
+def _is_target_crash(error: BaseException) -> bool:
+    text = str(error).casefold()
+    return any(
+        needle in text
+        for needle in (
+            "target crashed",
+            "target closed",
+            "browser has been closed",
+            "browser closed",
+            "page crashed",
+        )
+    )
+
+
+def _chromium_launch_args(*, headless: bool) -> list[str]:
+    args = list(BROWSER_ARGS)
+    if headless or os.name != "nt":
+        args.extend(LINUX_BROWSER_ARGS)
+    return args
+
+
 def _launch_chromium(playwright, *, headless: bool):
-    return playwright.chromium.launch(headless=headless, args=BROWSER_ARGS)
+    return playwright.chromium.launch(
+        headless=headless,
+        args=_chromium_launch_args(headless=headless),
+        chromium_sandbox=False,
+    )
 
 
 def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
-    browser = _launch_chromium(playwright, headless=headless)
-    context = create_browser_context(browser, cookies=cookies)
-    page = context.new_page()
-    warm_up_session(page)
-    return browser, context, page
+    last_error = None
+    for attempt in range(1, BROWSER_WARMUP_ATTEMPTS + 1):
+        browser = None
+        context = None
+        try:
+            browser = _launch_chromium(playwright, headless=headless)
+            context = create_browser_context(
+                browser,
+                cookies=cookies,
+                headless=headless,
+            )
+            page = context.new_page()
+            warm_up_session(page)
+            return browser, context, page
+        except Exception as error:
+            last_error = error
+            close_ebay_browser(browser, context)
+            if not _is_target_crash(error) or attempt >= BROWSER_WARMUP_ATTEMPTS:
+                raise
+            print(
+                f"Browser crashed during warmup (attempt {attempt}/"
+                f"{BROWSER_WARMUP_ATTEMPTS}): {error}",
+                flush=True,
+            )
+            time.sleep(BROWSER_RESTART_PAUSE_SECONDS)
+    raise last_error
 
 
 def close_ebay_browser(browser, context) -> None:
