@@ -4,9 +4,9 @@ const saveBtn = document.getElementById("save-cookie");
 const saveMsg = document.getElementById("cookie-save-msg");
 
 function describeCookie(payload) {
-  if (!payload.present) return "No cookie saved yet.";
+  if (!payload.present) return "No location cookie saved yet.";
   const names = (payload.cookie_names || []).join(", ");
-  return `Saved (${payload.characters.toLocaleString()} characters)${names ? ` · ${names}` : ""}`;
+  return `Location cookies only (${payload.characters.toLocaleString()} characters)${names ? ` · ${names}` : ""}`;
 }
 
 async function loadCookie() {
@@ -25,7 +25,10 @@ saveBtn.addEventListener("click", async () => {
       body: JSON.stringify({ cookie: input.value }),
     });
     statusLine.textContent = describeCookie(payload);
-    saveMsg.textContent = payload.present ? "Cookie updated." : "Cookie cleared.";
+    input.value = payload.cookie || "";
+    saveMsg.textContent = payload.present
+      ? `Kept location cookies: ${(payload.cookie_names || []).join(", ")}.`
+      : "Cookie cleared.";
   } catch (error) {
     saveMsg.textContent = error.message;
   } finally {

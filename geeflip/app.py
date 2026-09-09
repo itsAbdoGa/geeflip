@@ -297,6 +297,11 @@ def update_cookie(payload: dict = Body(...)) -> dict:
     write_cookie(cookie)
     status = cookie_status()
     status["cookie"] = read_cookie()
+    if cookie and not status["present"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No location/zip cookies found. Need dp1, nonsession, ns1, ebay, or zip.",
+        )
     return status
 
 

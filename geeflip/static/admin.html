@@ -34,8 +34,8 @@
         </div>
       </section>
       <section class="sheet admin-card">
-        <p class="admin-copy">Paste the full <code>Cookie</code> header from an eBay browser session. Saving it updates the file the headless scraper uses.</p>
-        <textarea id="cookie-input" rows="10" placeholder="nonsession=...; dp1=...; s=..."></textarea>
+        <p class="admin-copy">Paste an eBay <code>Cookie</code> header. Only location / zip cookies are kept (<code>dp1</code>, <code>nonsession</code>, <code>ns1</code>, <code>ebay</code>, <code>zip</code>). Login, bot, and tracking cookies are dropped so a US server is not tied to your PC session.</p>
+        <textarea id="cookie-input" rows="10" placeholder="nonsession=...; dp1=..."></textarea>
         <div class="admin-actions">
           <button type="button" class="go small" id="save-cookie">Save cookie</button>
           <span id="cookie-save-msg"></span>

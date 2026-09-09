@@ -6,6 +6,27 @@ GEEFLIP_ROOT = Path(__file__).resolve().parent
 COOKIE_FILE = GEEFLIP_ROOT / "data" / "ebay_cookies.txt"
 EBAY_COOKIE_FILE = GEEFLIP_ROOT.parent / "ebay" / "data" / "input" / "ebay_cookies.txt"
 
+# Guest location / ship-to only. Session, bot, and tracking cookies from a
+# personal PC confuse eBay when the scraper runs on another machine.
+LOCATION_COOKIE_NAMES = ("dp1", "nonsession", "ns1", "ebay", "zip")
+LOCATION_COOKIE_NAME_SET = {name.casefold() for name in LOCATION_COOKIE_NAMES}
+
+
+def keep_location_cookie_header(text: str) -> str:
+    by_name: dict[str, str] = {}
+    for part in (text or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip()
+        value = value.strip()
+        if name.casefold() in LOCATION_COOKIE_NAME_SET:
+            by_name[name.casefold()] = f"{name}={value}"
+    return "; ".join(
+        by_name[name] for name in LOCATION_COOKIE_NAMES if name in by_name
+    )
+
 
 def cookie_paths() -> list[Path]:
     return [COOKIE_FILE, EBAY_COOKIE_FILE]
@@ -14,14 +35,14 @@ def cookie_paths() -> list[Path]:
 def read_cookie() -> str:
     for path in cookie_paths():
         if path.exists():
-            text = path.read_text(encoding="utf-8").strip()
+            text = keep_location_cookie_header(path.read_text(encoding="utf-8"))
             if text:
                 return text
     return ""
 
 
 def write_cookie(text: str) -> Path:
-    cleaned = text.strip()
+    cleaned = keep_location_cookie_header(text)
     COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = f"{cleaned}\n" if cleaned else ""
     COOKIE_FILE.write_text(payload, encoding="utf-8")
@@ -40,6 +61,7 @@ def cookie_status() -> dict:
     return {
         "present": bool(text),
         "characters": len(text),
-        "cookie_names": names[:12],
+        "cookie_names": names,
+        "kept": list(LOCATION_COOKIE_NAMES),
         "path": str(COOKIE_FILE),
     }

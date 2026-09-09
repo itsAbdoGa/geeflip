@@ -138,6 +138,7 @@ SHIPPING_FREE_MARKERS = ("free delivery", "free shipping")
 US_LOCATION_MARKER = "united states"
 
 EBAY_COOKIE_URL = "https://www.ebay.com/"
+EBAY_LOCATION_COOKIE_NAMES = frozenset({"nonsession", "dp1", "ns1", "ebay", "zip"})
 EBAY_SESSION_COOKIE_NAMES = frozenset({"s", "ds2", "nonsession", "ebay", "dp1", "ns1"})
 
 
@@ -1185,7 +1186,11 @@ def parse_cookie_header(cookie_header: str) -> list[dict]:
             continue
 
         by_name[name] = _cookie_entry(name, value)
-    return list(by_name.values())
+    return [
+        cookie
+        for cookie in by_name.values()
+        if cookie["name"].casefold() in EBAY_LOCATION_COOKIE_NAMES
+    ]
 
 
 def load_ebay_cookies(
@@ -1216,6 +1221,9 @@ def describe_ebay_cookie_session(cookies: list[dict]) -> str:
         return "guest (no cookies)"
 
     names = {cookie["name"] for cookie in cookies}
+    location_names = sorted(names & EBAY_LOCATION_COOKIE_NAMES)
+    if location_names and not (names - EBAY_LOCATION_COOKIE_NAMES):
+        return f"US location ({len(cookies)} cookies: {', '.join(location_names)})"
     session_names = sorted(names & EBAY_SESSION_COOKIE_NAMES)
     if session_names:
         return f"account session ({len(cookies)} cookies, session: {', '.join(session_names)})"
