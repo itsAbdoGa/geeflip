@@ -1,6 +1,8 @@
 import os
 import re
+import subprocess
 import sys
+import threading
 import time
 import traceback
 from contextlib import contextmanager
@@ -30,6 +32,8 @@ BROWSER_ARGS = [
 ]
 BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
+_PLAYWRIGHT_CHROMIUM_LOCK = threading.Lock()
+_PLAYWRIGHT_CHROMIUM_READY = False
 
 STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -1243,12 +1247,41 @@ def parse_cookie_header(cookie_header: str) -> list[dict]:
     return list(by_name.values())
 
 
+def is_production() -> bool:
+    """True on the hosted site (Render and similar). Local runs stay false."""
+    override = os.environ.get("GEEFLIP_USE_COOKIES", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return False
+    if override in {"0", "false", "no", "off"}:
+        return True
+    if any(
+        str(os.environ.get(name) or "").strip()
+        for name in (
+            "RENDER",
+            "RENDER_SERVICE_ID",
+            "RAILWAY_ENVIRONMENT",
+            "FLY_APP_NAME",
+            "K_SERVICE",
+        )
+    ):
+        return True
+    env = (
+        os.environ.get("GEEFLIP_ENV")
+        or os.environ.get("ENVIRONMENT")
+        or ""
+    ).strip().lower()
+    return env in {"prod", "production"}
+
+
 def load_ebay_cookies(
     *,
     cookie_header: str | None = None,
     cookies_file: Path | None = None,
     default_cookies_file: Path | None = None,
 ) -> list[dict]:
+    if is_production():
+        return []
+
     header = (cookie_header or "").strip()
 
     if not header and cookies_file is not None and cookies_file.exists():
@@ -1317,12 +1350,99 @@ def warm_up_session(page: Page) -> None:
         raise
 
 
+def ensure_playwright_chromium_installed() -> None:
+    """
+    Ensure Playwright Chromium browser exists in environments without shell access.
+    Set SKIP_PLAYWRIGHT_INSTALL=1 to disable this bootstrap step.
+    """
+    global _PLAYWRIGHT_CHROMIUM_READY
+    if os.getenv("SKIP_PLAYWRIGHT_INSTALL", "").strip().lower() in {"1", "true", "yes"}:
+        print(
+            "GEEFLIP: Skipping Playwright Chromium bootstrap (SKIP_PLAYWRIGHT_INSTALL=1).",
+            flush=True,
+        )
+        return
+
+    with _PLAYWRIGHT_CHROMIUM_LOCK:
+        if _PLAYWRIGHT_CHROMIUM_READY:
+            return
+
+        try:
+            from playwright.sync_api import sync_playwright as _sync_playwright
+        except Exception as exc:
+            print(f"GEEFLIP: Playwright package not available yet: {exc}", flush=True)
+            print(
+                "GEEFLIP: Install dependencies first (requirements.txt includes playwright).",
+                flush=True,
+            )
+            return
+
+        def probe() -> None:
+            with _sync_playwright() as playwright:
+                kwargs = {"headless": True, "args": BROWSER_ARGS}
+                if is_production():
+                    kwargs["chromium_sandbox"] = False
+                browser = playwright.chromium.launch(**kwargs)
+                browser.close()
+
+        try:
+            probe()
+            print("GEEFLIP: Playwright Chromium already installed.", flush=True)
+            _PLAYWRIGHT_CHROMIUM_READY = True
+            return
+        except Exception as exc:
+            print(
+                f"GEEFLIP: Playwright Chromium missing/unusable ({exc}); installing...",
+                flush=True,
+            )
+
+        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.stdout:
+                print(proc.stdout, flush=True)
+            if proc.returncode != 0:
+                if proc.stderr:
+                    print(proc.stderr, flush=True)
+                print(
+                    f"GEEFLIP: Playwright install failed with exit code {proc.returncode}.",
+                    flush=True,
+                )
+                return
+            print("GEEFLIP: Playwright Chromium installation complete.", flush=True)
+        except Exception as exc:
+            print(f"GEEFLIP: Failed to run Playwright install command: {exc}", flush=True)
+            return
+
+        try:
+            probe()
+            print("GEEFLIP: Playwright Chromium is ready.", flush=True)
+            _PLAYWRIGHT_CHROMIUM_READY = True
+        except Exception as exc:
+            print(f"GEEFLIP: Chromium still unusable after install ({exc})", flush=True)
+
+
+def _launch_chromium(playwright, *, headless: bool):
+    kwargs = {
+        "headless": headless,
+        "args": BROWSER_ARGS,
+    }
+    if is_production():
+        kwargs["chromium_sandbox"] = False
+        return playwright.chromium.launch(**kwargs)
+    try:
+        return playwright.chromium.launch(channel="chrome", **kwargs)
+    except Exception as error:
+        print(
+            f"GEEFLIP: system Chrome unavailable ({error}); using Playwright Chromium",
+            flush=True,
+        )
+        return playwright.chromium.launch(**kwargs)
+
+
 def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
-    browser = playwright.chromium.launch(
-        headless=headless,
-        channel="chrome",
-        args=BROWSER_ARGS,
-    )
+    ensure_playwright_chromium_installed()
+    browser = _launch_chromium(playwright, headless=headless)
     context = create_browser_context(browser, cookies=cookies)
     page = context.new_page()
     warm_up_session(page)
@@ -1380,8 +1500,16 @@ def browser_session(
     default_cookies_file: Path | None = None,
     headless: bool = False,
 ) -> Iterator[EbayBrowserSession]:
-    del cookie_header, cookies_file, default_cookies_file
-    session_cookies = cookies if cookies is not None else []
+    if is_production():
+        session_cookies: list[dict] = []
+    elif cookies is not None:
+        session_cookies = cookies
+    else:
+        session_cookies = load_ebay_cookies(
+            cookie_header=cookie_header,
+            cookies_file=cookies_file,
+            default_cookies_file=default_cookies_file,
+        )
 
     with sync_playwright() as playwright:
         session = EbayBrowserSession(playwright, session_cookies, headless=headless)

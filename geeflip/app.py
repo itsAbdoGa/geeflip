@@ -27,6 +27,7 @@ for path in (str(GEEFLIP_ROOT), str(EBAY_ROOT), str(PROJECT_ROOT)):
 
 from cookies import read_cookie, write_cookie, cookie_status
 from db import GeeflipStore
+from lib.ebay_scraper import ensure_playwright_chromium_installed
 from scrape_runner import ScrapeRunner, coerce_filters
 
 store = GeeflipStore()
@@ -67,6 +68,8 @@ async def lifespan(_app: FastAPI):
             f"({images.get('with_image', 0):,} products)",
             flush=True,
         )
+    print("GEEFLIP: ensuring Playwright Chromium is installed", flush=True)
+    ensure_playwright_chromium_installed()
     print("GEEFLIP: http://127.0.0.1:8787", flush=True)
     yield
 
