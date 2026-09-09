@@ -8,15 +8,14 @@ Then open http://127.0.0.1:8787
 from __future__ import annotations
 
 import asyncio
-import logging
+import json
 import sys
-import threading
 from pathlib import Path
 
 from contextlib import asynccontextmanager
 
-from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi import Body, FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 GEEFLIP_ROOT = Path(__file__).resolve().parent
@@ -26,27 +25,12 @@ for path in (str(GEEFLIP_ROOT), str(EBAY_ROOT), str(PROJECT_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
+from cookies import read_cookie, write_cookie, cookie_status
 from db import GeeflipStore
-from lib.ebay_scraper import ensure_playwright_chromium_installed
 from scrape_runner import ScrapeRunner, coerce_filters
 
 store = GeeflipStore()
 runner = ScrapeRunner(store)
-
-
-class _QuietAccessLog(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        noisy = (
-            "GET /api/status" in message
-            or "GET /api/winners" in message
-            or "GET /api/scrape/logs" in message
-            or '"HEAD / ' in message
-        )
-        return not noisy
-
-
-logging.getLogger("uvicorn.access").addFilter(_QuietAccessLog())
 
 
 @asynccontextmanager
@@ -83,50 +67,31 @@ async def lifespan(_app: FastAPI):
             f"({images.get('with_image', 0):,} products)",
             flush=True,
         )
-    print("GEEFLIP: http://0.0.0.0:8787", flush=True)
-    threading.Thread(
-        target=ensure_playwright_chromium_installed,
-        name="playwright-install",
-        daemon=True,
-    ).start()
+    print("GEEFLIP: http://127.0.0.1:8787", flush=True)
     yield
 
 
 app = FastAPI(title="GEEFLIP", lifespan=lifespan)
 
 
-def html_page(name: str) -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / name)
-
-
 @app.get("/")
 def index() -> FileResponse:
-    return html_page("index.html")
+    return FileResponse(GEEFLIP_ROOT / "static" / "index.html")
 
 
-@app.head("/")
-def index_head() -> Response:
-    return Response(status_code=200)
-
-
-@app.api_route("/asins", methods=["GET", "HEAD"])
+@app.get("/asins")
 def asins_page() -> FileResponse:
-    return html_page("asins.html")
+    return FileResponse(GEEFLIP_ROOT / "static" / "asins.html")
 
 
-@app.api_route("/history", methods=["GET", "HEAD"])
+@app.get("/history")
 def history_page() -> FileResponse:
-    return html_page("history.html")
+    return FileResponse(GEEFLIP_ROOT / "static" / "history.html")
 
 
-@app.api_route("/admin", methods=["GET", "HEAD"])
+@app.get("/admin")
 def admin_page() -> FileResponse:
-    return html_page("admin.html")
-
-
-@app.api_route("/favicon.ico", methods=["GET", "HEAD"])
-def favicon() -> Response:
-    return Response(status_code=204)
+    return FileResponse(GEEFLIP_ROOT / "static" / "admin.html")
 
 
 @app.get("/api/status")
@@ -180,7 +145,35 @@ def stop_scrape() -> dict:
     return runner.stop()
 
 
-def winners_payload(run_id: int | None = None, limit: int = 80, offset: int = 0) -> dict:
+@app.get("/api/scrape/logs")
+async def scrape_logs(after: int = 0) -> StreamingResponse:
+    async def generate():
+        last_id = after
+        while True:
+            lines = runner.logs_after(last_id)
+            for item in lines:
+                last_id = item["id"]
+                yield f"data: {json.dumps(item)}\n\n"
+            yield ": ping\n\n"
+            await asyncio.sleep(0.35)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/winners")
+def winners(
+    run_id: int | None = None,
+    limit: int = 80,
+    offset: int = 0,
+) -> dict:
     rows = store.list_winners(
         run_id=run_id,
         limit=max(1, min(limit, 300)),
@@ -192,62 +185,6 @@ def winners_payload(run_id: int | None = None, limit: int = 80, offset: int = 0)
         "count": store.winner_count(run_id=run_id),
         "winners": rows,
     }
-
-
-@app.websocket("/ws/live")
-async def live_updates(websocket: WebSocket, after: int = 0) -> None:
-    await websocket.accept()
-    last_log_id = max(0, after)
-    last_status_key = None
-    last_winners_key = None
-    try:
-        while True:
-            snapshot = runner.snapshot()
-            logs = runner.logs_after(last_log_id)
-            if logs:
-                last_log_id = logs[-1]["id"]
-                await websocket.send_json({"type": "logs", "logs": logs})
-
-            status_key = (
-                snapshot["status"],
-                snapshot["run_id"],
-                snapshot["winners_run"],
-                snapshot["winners_total"],
-                snapshot["exit_code"],
-            )
-            if status_key != last_status_key:
-                await websocket.send_json({"type": "status", "status": snapshot})
-                last_status_key = status_key
-
-            winners_key = (
-                snapshot["status"],
-                snapshot["run_id"],
-                snapshot["winners_run"],
-                snapshot["winners_total"],
-            )
-            if winners_key != last_winners_key:
-                run_id = (
-                    snapshot["run_id"]
-                    if snapshot["status"] in {"running", "stopping"}
-                    else None
-                )
-                await websocket.send_json(
-                    {"type": "winners", **winners_payload(run_id=run_id)}
-                )
-                last_winners_key = winners_key
-
-            await asyncio.to_thread(runner.wait_for_update, 1.0)
-    except WebSocketDisconnect:
-        return
-
-
-@app.get("/api/winners")
-def winners(
-    run_id: int | None = None,
-    limit: int = 80,
-    offset: int = 0,
-) -> dict:
-    return winners_payload(run_id=run_id, limit=limit, offset=offset)
 
 
 @app.post("/api/winners/{winner_id}/seen")
@@ -277,10 +214,31 @@ def asins(q: str = "", offset: int = 0, limit: int = 50) -> dict:
     )
 
 
+@app.get("/api/admin/cookie")
+def get_cookie() -> dict:
+    status = cookie_status()
+    status["cookie"] = read_cookie()
+    return status
+
+
+@app.post("/api/admin/cookie")
+def update_cookie(payload: dict = Body(...)) -> dict:
+    cookie = str(payload.get("cookie") or "").strip()
+    if cookie and "=" not in cookie:
+        raise HTTPException(
+            status_code=400,
+            detail="That does not look like a cookie header (expected name=value pairs).",
+        )
+    write_cookie(cookie)
+    status = cookie_status()
+    status["cookie"] = read_cookie()
+    return status
+
+
 app.mount("/static", StaticFiles(directory=GEEFLIP_ROOT / "static"), name="static")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8787, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=8777, log_level="info")

@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from lib.ebay_scraper import (
     BROWSER_RESTART_EVERY,
+    EbayShipToNotUsError,
     browser_session,
     evaluate_winning_listing,
     fetch_amazon_sales_rank,
@@ -25,8 +26,9 @@ from lib.ebay_scraper import (
     format_below_buybox_listing_logs,
     format_block_log,
     format_cheapest_listing_log,
-    is_browser_crash,
+    log_page_debug,
     parse_price,
+    refresh_and_verify_ship_to_us,
     scrape_image_search_page,
     scrape_search_page,
     scrape_search_page_from_html,
@@ -97,6 +99,8 @@ class ScrapeSettings:
     identifier_no_match_retention_days: int = 3
 
     html_path: Path | None = None
+    cookies_file: Path | None = None
+    cookie_header: str | None = None
 
     headless: bool = False
     write_xlsx: bool = True
@@ -1301,7 +1305,9 @@ def process_product(
     query_type = str(product.get("search_identifier_type") or "").upper()
     if query_type in {"EAN", "UPC"}:
         if result.get("error") or result.get("block_reason"):
-            pass
+            raise RuntimeError(
+                result.get("block_reason") or result.get("error") or "search error"
+            )
         elif not result.get("listings"):
             if no_exact_match_callback is not None:
                 no_exact_match_callback(product)
@@ -1364,9 +1370,30 @@ def process_product(
                 )
             )
         except Exception as error:
-            print(f"  Image search failed: {type(error).__name__}: {error}")
+            log_page_debug(reason="image search failed", error=error, page=page)
+            raise
 
     return product_winners
+
+
+def process_live_product_with_ship_to_retry(
+    page,
+    product: dict[str, str],
+    **kwargs,
+) -> list[dict]:
+    try:
+        return process_product(page, product, saved_html=None, **kwargs)
+    except EbayShipToNotUsError as error:
+        identifier_type, identifier = query_label(product)
+        print(f"  Ship to is not US for {identifier_type} {identifier}: {error}")
+        log_page_debug(
+            reason="ship-to not US before refresh",
+            error=error,
+            page=page,
+        )
+        print("  Refreshing and retrying this search")
+        refresh_and_verify_ship_to_us(page)
+        return process_product(page, product, saved_html=None, **kwargs)
 
 
 def _store_method(store: object | None, name: str):
@@ -1479,6 +1506,7 @@ def main(settings: ScrapeSettings | None = None) -> int:
     image_search_cache: dict[str, dict] = {}
     total = len(products)
     exit_code = 0
+    halted_by_error = False
     skipped_previous_winners = 0
     current_product: dict[str, str] | None = None
     winner_history: list[dict] = []
@@ -1635,7 +1663,7 @@ def main(settings: ScrapeSettings | None = None) -> int:
             print("eBay session: guest (no cookies)")
             if BROWSER_RESTART_EVERY:
                 print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
-            with browser_session(headless=settings.headless) as session:
+            with browser_session(cookies=[], headless=settings.headless) as session:
                 searches_since_browser_start = 0
                 for index, product in enumerate(products, start=1):
                     if requested_stop():
@@ -1673,43 +1701,40 @@ def main(settings: ScrapeSettings | None = None) -> int:
                         )
                         continue
                     try:
-                        product_winners = process_product(
+                        product_winners = process_live_product_with_ship_to_retry(
                             session.page,
                             product,
-                            saved_html=None,
                             **process_kwargs(display_index, display_total, live=True),
                         )
                     except Exception as error:
-                        if not is_browser_crash(error):
-                            raise
-                        print(
-                            "  Browser crashed; restarting and retrying this search: "
-                            f"{error}"
+                        log_page_debug(
+                            reason="scrape failed",
+                            error=error,
+                            page=session.page,
                         )
-                        session.restart()
-                        searches_since_browser_start = 0
-                        product_winners = process_product(
-                            session.page,
-                            product,
-                            saved_html=None,
-                            **process_kwargs(display_index, display_total, live=True),
-                        )
-
+                        raise
                     keep_winners(product_winners)
         if stop_reason:
             print("Scrape stopped from the website; saving winners collected so far")
             log_current_stop(stop_reason)
             exit_code = 130
+    except EbayShipToNotUsError as error:
+        halted_by_error = True
+        print(f"Stopping scrape: {error}")
+        log_current_stop(str(error))
+        exit_code = 1
     except KeyboardInterrupt:
+        halted_by_error = True
         print("Scrape stopped by user; saving winners collected so far")
         log_current_stop("stopped by user")
         exit_code = 130
     except Exception as error:
+        halted_by_error = True
         print(f"Scrape stopped by {type(error).__name__}: {error}")
         log_current_stop(f"{type(error).__name__}: {error}")
         exit_code = 1
 
-    if pending_identifier_deletions:
+    if pending_identifier_deletions and not halted_by_error:
         try:
             deleted_cells = apply_identifier_deletions(
                 input_file,
@@ -1728,6 +1753,8 @@ def main(settings: ScrapeSettings | None = None) -> int:
         except Exception as error:
             print(f"Error deleting repeated no-match identifiers: {error}")
             exit_code = 1
+    elif pending_identifier_deletions:
+        print("Not deleting EAN/UPC cells because the scrape stopped on an error")
 
     if settings.write_json:
         try:

@@ -1,9 +1,8 @@
 import os
 import re
-import subprocess
 import sys
-import threading
 import time
+import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -19,9 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
 import image_search
 
 PAGE_TIMEOUT_MS = 25_000
-RESULTS_SELECTOR_TIMEOUT_MS = 20_000
+RESULTS_SELECTOR_TIMEOUT_MS = 4_000
 VISUAL_SEARCH_RESULTS_TIMEOUT_MS = 8_000
-CHALLENGE_WAIT_TIMEOUT_MS = 35_000
 
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -30,16 +28,8 @@ BROWSER_ARGS = [
     "--window-position=0,0",
     "--ignore-certificate-errors",
 ]
-LINUX_BROWSER_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-gpu",
-    "--disable-software-rasterizer",
-    "--mute-audio",
-]
 BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
-BROWSER_WARMUP_ATTEMPTS = 3
 
 STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -57,7 +47,6 @@ BLOCK_MARKERS = (
     "are you a robot",
     "pardon our interruption",
     "checking your browser before accessing",
-    "checking your browser before you access",
     "please verify yourself to continue",
 )
 
@@ -82,11 +71,7 @@ RESULT_MARKERS = (
     "srp-save-null-search",
 )
 
-RESULTS_WAIT_SELECTOR = (
-    ".srp-river-results li.s-card[data-listingid], "
-    ".srp-river-results li.s-card, "
-    ".srp-river-results .s-item-card"
-)
+RESULTS_WAIT_SELECTOR = ".srp-river-results li.s-card, .srp-river-results .s-item-card"
 NO_EXACT_MATCH_SELECTOR = ".srp-save-null-search__heading"
 SEARCH_READY_SELECTOR = f"{RESULTS_WAIT_SELECTOR}, {NO_EXACT_MATCH_SELECTOR}"
 VISUAL_SEARCH_READY_SELECTOR = (
@@ -97,10 +82,14 @@ RESULTS_LIST_SELECTORS = ("ul.srp-results", ".srp-river-results")
 INTERNATIONAL_DIVIDER_CLASS = "srp-river-answer--REWRITE_START"
 LISTING_CARD_CLASSES = frozenset({"s-card", "s-item-card"})
 SHIP_TO_CONTAINER_SELECTOR = ".gh-ship-to"
+SHIP_TO_US_ICON_SELECTOR = ".gh-ship-to .fl-us, .gh-ship-to__menu-icon.fl-us"
+SHIP_TO_WAIT_TIMEOUT_MS = 8_000
+SHIP_TO_RETRY_WAIT_SECONDS = 3.0
 MIN_RESULTS_PAGE_BYTES = 10_000
 BODY_PREVIEW_CHARS = 500
 HTML_DEBUG_CHARS = 12_000
 BODY_TEXT_DEBUG_CHARS = 2_500
+EBAY_SOURCE_HTML = PROJECT_ROOT / "ebay" / "data" / "input" / "ebay_source.html"
 NEW_LISTING_SELECTOR = "span.s-card__new-listing"
 EBAYIMG_URL_RE = re.compile(
     r"https://i\.ebayimg\.com/images/g/[^/\s,]+/s-l\d+\.(?:webp|jpg)",
@@ -138,6 +127,9 @@ DATE_PARSE_FORMATS = ("%b-%d %H:%M", "%b-%d", "%b %d %H:%M", "%b %d")
 SHIPPING_FREE_MARKERS = ("free delivery", "free shipping")
 US_LOCATION_MARKER = "united states"
 
+EBAY_COOKIE_URL = "https://www.ebay.com/"
+EBAY_SESSION_COOKIE_NAMES = frozenset({"s", "ds2", "nonsession", "ebay", "dp1", "ns1"})
+
 
 @dataclass
 class PageFetchResult:
@@ -171,6 +163,18 @@ class EbayBlockedError(Exception):
             f"status={status_code}, final_url={final_url}, "
             f"bytes={content_length}"
         )
+        super().__init__(message)
+
+
+class EbayShipToNotUsError(Exception):
+    """Raised when the header Ship to control is not set to the United States."""
+
+    def __init__(self, reason: str, *, detail: str = "") -> None:
+        self.reason = reason
+        self.detail = detail
+        message = f"eBay Ship to is not US ({reason})"
+        if detail:
+            message = f"{message}: {detail}"
         super().__init__(message)
 
 
@@ -245,7 +249,7 @@ def extract_seller_from_listing_html(html: str) -> tuple[str, int | None]:
 
 
 def fetch_listing_seller_details(page: Page, url: str) -> tuple[str, int | None]:
-    goto_ebay(page, url)
+    page.goto(url, wait_until="commit", timeout=0)
     try:
         page.wait_for_selector(
             SELLER_CARD_SELECTOR,
@@ -379,6 +383,102 @@ def extract_shipping(attr_rows: list[str]) -> tuple[str, float | None]:
 
 def is_united_states_listing(location: str) -> bool:
     return US_LOCATION_MARKER in location.casefold()
+
+
+def _class_tokens(node) -> set[str]:
+    raw = node.attributes.get("class") or ""
+    return {part.casefold() for part in raw.split() if part}
+
+
+def is_ship_to_us_html(html: str) -> bool | None:
+    """Return True if Ship to is US, False if present but not US, None if missing."""
+    tree = HTMLParser(html)
+    container = tree.css_first(SHIP_TO_CONTAINER_SELECTOR)
+    if container is None:
+        return None
+
+    for icon in container.css(".gh-ship-to__menu-icon, .fl-pic, i"):
+        if "fl-us" in _class_tokens(icon):
+            return True
+
+    if container.css_first(SHIP_TO_US_ICON_SELECTOR) is not None:
+        return True
+
+    button = container.css_first("button.gh-ship-to__menu")
+    if button is not None:
+        aria = (button.attributes.get("aria-label") or "").casefold()
+        if "united states" in aria:
+            return True
+
+    return False
+
+
+def assert_ship_to_us_html(html: str) -> None:
+    status = is_ship_to_us_html(html)
+    if status is True:
+        return
+    if status is None:
+        raise EbayShipToNotUsError(
+            "missing_ship_to_control",
+            detail=f"selector={SHIP_TO_CONTAINER_SELECTOR}",
+        )
+    raise EbayShipToNotUsError(
+        "not_us",
+        detail="expected .gh-ship-to .fl-us (United States)",
+    )
+
+
+def _ship_to_button(page: Page):
+    return page.query_selector(f"{SHIP_TO_CONTAINER_SELECTOR} button.gh-ship-to__menu")
+
+
+def _ship_to_aria_label(page: Page) -> str:
+    button = _ship_to_button(page)
+    if button is None:
+        return ""
+    return (button.get_attribute("aria-label") or "").strip()
+
+
+def verify_ship_to_us(page: Page) -> None:
+    """Ensure the header Ship to control shows the US flag (fl-us)."""
+    try:
+        page.wait_for_selector(
+            SHIP_TO_CONTAINER_SELECTOR,
+            timeout=SHIP_TO_WAIT_TIMEOUT_MS,
+            state="attached",
+        )
+    except PlaywrightTimeoutError as exc:
+        raise EbayShipToNotUsError(
+            "missing_ship_to_control",
+            detail=f"selector={SHIP_TO_CONTAINER_SELECTOR}",
+        ) from exc
+
+    # Country flag is hydrated async after the container mounts.
+    try:
+        page.wait_for_function(
+            """() => {
+                const icon = document.querySelector('.gh-ship-to .fl-us, .gh-ship-to__menu-icon.fl-us');
+                if (icon) return true;
+                const button = document.querySelector('.gh-ship-to button.gh-ship-to__menu');
+                const aria = (button && button.getAttribute('aria-label') || '').toLowerCase();
+                return aria.includes('united states');
+            }""",
+            timeout=SHIP_TO_WAIT_TIMEOUT_MS,
+        )
+        return
+    except PlaywrightTimeoutError:
+        pass
+
+    detail = _ship_to_aria_label(page) or "no fl-us class on .gh-ship-to__menu-icon"
+    raise EbayShipToNotUsError("not_us", detail=detail)
+
+
+def refresh_and_verify_ship_to_us(page: Page) -> None:
+    page.reload(
+        wait_until="domcontentloaded",
+        timeout=PAGE_TIMEOUT_MS,
+    )
+    verify_ship_to_us(page)
 
 
 def filter_us_listings(listings: list[dict]) -> list[dict]:
@@ -717,63 +817,6 @@ def has_no_exact_search_results(tree: HTMLParser) -> bool:
     return "no exact matches found" in heading.text(separator=" ", strip=True).casefold()
 
 
-def html_has_listing_cards(tree: HTMLParser) -> bool:
-    return bool(
-        tree.css("li.s-card[data-listingid]")
-        or tree.css(".srp-river-results li.s-card")
-        or tree.css(".s-item-card")
-    )
-
-
-def log_page_debug(
-    *,
-    reason: str,
-    error: BaseException | None = None,
-    html: str = "",
-    url: str = "",
-    page: Page | None = None,
-) -> None:
-    if page is not None:
-        try:
-            url = page.url or url
-        except Exception:
-            pass
-        if not html:
-            try:
-                html = page.content()
-            except Exception as read_error:
-                print(
-                    f"  DEBUG could not read page HTML ({type(read_error).__name__}: {read_error})",
-                    flush=True,
-                )
-                html = ""
-    tree = HTMLParser(html or "")
-    title_node = tree.css_first("title")
-    title = title_node.text(strip=True) if title_node is not None else ""
-    body = tree.css_first("body")
-    body_html = body.html if body is not None else (html or "")
-    body_text = " ".join(
-        (body.text(separator=" ", strip=True) if body is not None else "")[:4000].split()
-    )
-    ship = tree.css_first(SHIP_TO_CONTAINER_SELECTOR)
-    ship_html = (ship.html or "")[:800] if ship is not None else "(missing .gh-ship-to)"
-    print(f"  DEBUG {reason}", flush=True)
-    if error is not None:
-        print(f"  DEBUG exception: {type(error).__name__}: {error}", flush=True)
-    print(f"  DEBUG url: {url}", flush=True)
-    print(f"  DEBUG title: {title}", flush=True)
-    print(
-        f"  DEBUG html_bytes={len(html or '')} "
-        f"s-card={len(tree.css('li.s-card'))} "
-        f"listingid={len(tree.css('[data-listingid]'))} "
-        f"null-search={len(tree.css(NO_EXACT_MATCH_SELECTOR))}",
-        flush=True,
-    )
-    print(f"  DEBUG ship-to html: {ship_html}", flush=True)
-    print(f"  DEBUG body text: {body_text[:BODY_TEXT_DEBUG_CHARS]}", flush=True)
-    print(f"  DEBUG body html:\n{body_html[:HTML_DEBUG_CHARS]}", flush=True)
-
-
 def iter_direct_element_children(node):
     child = node.child
     while child:
@@ -802,6 +845,71 @@ def extract_domestic_listing_cards(tree: HTMLParser) -> list:
 
     nested_cards = results_list.css("li.s-card")
     return nested_cards if nested_cards else results_list.css(".s-item-card")
+
+
+def log_page_debug(
+    *,
+    reason: str,
+    error: BaseException | None = None,
+    html: str = "",
+    url: str = "",
+    page: Page | None = None,
+) -> None:
+    if page is not None:
+        try:
+            url = page.url or url
+        except Exception:
+            pass
+        if not html:
+            try:
+                html = page.content()
+            except Exception as read_error:
+                print(
+                    f"  DEBUG could not read page HTML "
+                    f"({type(read_error).__name__}: {read_error})",
+                    flush=True,
+                )
+                html = ""
+
+    tree = HTMLParser(html or "")
+    title_node = tree.css_first("title")
+    title = title_node.text(strip=True) if title_node is not None else ""
+    body = tree.css_first("body")
+    body_html = body.html if body is not None else (html or "")
+    body_text = " ".join(
+        (body.text(separator=" ", strip=True) if body is not None else "")[:4000].split()
+    )
+    ship = tree.css_first(SHIP_TO_CONTAINER_SELECTOR)
+    ship_html = (ship.html or "")[:800] if ship is not None else "(missing .gh-ship-to)"
+
+    print(f"  DEBUG {reason}", flush=True)
+    if error is not None:
+        print(f"  DEBUG exception: {type(error).__name__}: {error}", flush=True)
+        traceback.print_exception(error)
+    print(f"  DEBUG url: {url}", flush=True)
+    print(f"  DEBUG title: {title}", flush=True)
+    print(
+        f"  DEBUG html_bytes={len(html or '')} "
+        f"s-card={len(tree.css('li.s-card'))} "
+        f"listingid={len(tree.css('[data-listingid]'))} "
+        f"null-search={len(tree.css(NO_EXACT_MATCH_SELECTOR))}",
+        flush=True,
+    )
+    print(f"  DEBUG ship-to html: {ship_html}", flush=True)
+    print(f"  DEBUG body text: {body_text[:BODY_TEXT_DEBUG_CHARS]}", flush=True)
+    print(f"  DEBUG body html:\n{body_html[:HTML_DEBUG_CHARS]}", flush=True)
+
+    if html:
+        try:
+            EBAY_SOURCE_HTML.parent.mkdir(parents=True, exist_ok=True)
+            EBAY_SOURCE_HTML.write_text(html, encoding="utf-8")
+            print(f"  DEBUG saved HTML to {EBAY_SOURCE_HTML}", flush=True)
+        except Exception as write_error:
+            print(
+                f"  DEBUG could not save HTML "
+                f"({type(write_error).__name__}: {write_error})",
+                flush=True,
+            )
 
 
 def to_s_l500(url: str) -> str:
@@ -1107,264 +1215,118 @@ def fetch_amazon_sales_rank(page: Page, url: str) -> int | None:
     return extract_amazon_sales_rank(page.content())
 
 
-def create_browser_context(
-    browser: Browser,
+def _cookie_entry(name: str, value: str) -> dict:
+    return {
+        "name": name,
+        "value": value,
+        "url": EBAY_COOKIE_URL,
+        "secure": True,
+        "sameSite": "Lax",
+    }
+
+
+def parse_cookie_header(cookie_header: str) -> list[dict]:
+    # Last value wins when the header repeats a name (e.g. ds2).
+    by_name: dict[str, dict] = {}
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+
+        name, _, value = part.partition("=")
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+
+        by_name[name] = _cookie_entry(name, value)
+    return list(by_name.values())
+
+
+def load_ebay_cookies(
     *,
-    headless: bool = False,
-):
-    viewport = (
-        {"width": 1024, "height": 720}
-        if headless
-        else {"width": 1440, "height": 900}
-    )
+    cookie_header: str | None = None,
+    cookies_file: Path | None = None,
+    default_cookies_file: Path | None = None,
+) -> list[dict]:
+    header = (cookie_header or "").strip()
+
+    if not header and cookies_file is not None and cookies_file.exists():
+        header = cookies_file.read_text(encoding="utf-8").strip()
+
+    if not header:
+        header = os.environ.get("EBAY_COOKIES", "").strip()
+
+    if not header and default_cookies_file is not None and default_cookies_file.exists():
+        header = default_cookies_file.read_text(encoding="utf-8").strip()
+
+    if not header:
+        return []
+
+    return parse_cookie_header(header)
+
+
+def describe_ebay_cookie_session(cookies: list[dict]) -> str:
+    if not cookies:
+        return "guest (no cookies)"
+
+    names = {cookie["name"] for cookie in cookies}
+    session_names = sorted(names & EBAY_SESSION_COOKIE_NAMES)
+    if session_names:
+        return f"account session ({len(cookies)} cookies, session: {', '.join(session_names)})"
+    return f"custom cookies ({len(cookies)} cookies)"
+
+
+def apply_cookies_to_context(context, cookies: list[dict]) -> None:
+    if cookies:
+        context.add_cookies(cookies)
+
+
+def create_browser_context(browser: Browser, *, cookies: list[dict] | None = None):
     context = browser.new_context(
         locale="en-US",
         timezone_id="America/New_York",
-        viewport=viewport,
+        viewport={"width": 1440, "height": 900},
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
+    apply_cookies_to_context(context, cookies or [])
     return context
 
 
-def is_ebay_challenge_url(url: str) -> bool:
-    return "splashui/challenge" in (url or "").casefold()
-
-
-def page_is_ebay_challenge(page: Page) -> bool:
+def warm_up_session(page: Page) -> None:
     try:
-        url = page.url or ""
-    except Exception:
-        url = ""
-    if is_ebay_challenge_url(url):
-        return True
-    try:
-        title = (page.title() or "").casefold()
-    except Exception:
-        title = ""
-    return "pardon our interruption" in title
-
-
-def wait_out_ebay_challenge(
-    page: Page,
-    *,
-    timeout_ms: int = CHALLENGE_WAIT_TIMEOUT_MS,
-) -> bool:
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=5_000)
-    except Exception:
-        pass
-    if not page_is_ebay_challenge(page):
-        return False
-    print("eBay bot-check splash detected; waiting for redirect...", flush=True)
-    try:
-        page.wait_for_url(
-            lambda landed: not is_ebay_challenge_url(landed),
+        page.goto(
+            "https://www.ebay.com/",
             wait_until="domcontentloaded",
-            timeout=timeout_ms,
+            timeout=0,
         )
         try:
-            page.wait_for_function(
-                """() => {
-                    const title = (document.title || '').toLowerCase();
-                    if (title.includes('pardon our interruption')) return false;
-                    const heading = document.querySelector('.pgHeading, h1');
-                    const text = ((heading && heading.innerText) || '').toLowerCase();
-                    return !text.includes('checking your browser');
-                }""",
-                timeout=8_000,
-            )
-        except PlaywrightTimeoutError:
-            pass
-        print(f"eBay bot-check finished; now at {page.url}", flush=True)
-        return True
-    except PlaywrightTimeoutError:
-        current = ""
-        try:
-            current = page.url or ""
-        except Exception:
-            pass
-        print(
-            f"eBay bot-check still showing after {timeout_ms}ms: {current}",
-            flush=True,
-        )
-        raise EbayBlockedError(
-            url=current,
-            status_code=0,
-            final_url=current,
-            content_length=0,
-            reason="bot-check splash did not redirect",
-            body_preview="Pardon Our Interruption / Checking your browser",
-        )
-
-
-def goto_ebay(page: Page, url: str, *, wait_until: str = "domcontentloaded"):
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            response = page.goto(
-                url,
-                wait_until=wait_until,
+            verify_ship_to_us(page)
+            return
+        except EbayShipToNotUsError as error:
+            print(f"Ship to is not US on browser open: {error}")
+            print("Refreshing homepage and waiting before checking again")
+            page.reload(
+                wait_until="domcontentloaded",
                 timeout=PAGE_TIMEOUT_MS,
             )
-            wait_out_ebay_challenge(page)
-            return response
-        except Exception as error:
-            text = str(error)
-            recoverable = (
-                "ERR_ABORTED" in text
-                or "interrupted" in text.casefold()
-                or "navigating and changing the content" in text.casefold()
-            )
-            if not recoverable:
-                raise
-            print(
-                f"Navigation interrupted (attempt {attempt}/3): {error}",
-                flush=True,
-            )
-            wait_out_ebay_challenge(page)
-            last_error = error
-    raise last_error
+            time.sleep(SHIP_TO_RETRY_WAIT_SECONDS)
+            verify_ship_to_us(page)
+    except Exception as error:
+        log_page_debug(reason="homepage warmup failed", error=error, page=page)
+        raise
 
 
-def warm_up_session(page: Page, *, headless: bool = False) -> None:
-    print("Opening eBay homepage to pass bot-check", flush=True)
-    goto_ebay(page, "https://www.ebay.com/")
-
-
-_PLAYWRIGHT_CHROMIUM_LOCK = threading.Lock()
-_PLAYWRIGHT_CHROMIUM_READY = False
-
-
-def ensure_playwright_chromium_installed() -> None:
-    """Ensure Playwright Chromium exists in environments without shell access.
-
-    Set SKIP_PLAYWRIGHT_INSTALL=1 to disable this bootstrap step.
-    """
-    global _PLAYWRIGHT_CHROMIUM_READY
-    if os.getenv("SKIP_PLAYWRIGHT_INSTALL", "").strip().lower() in {"1", "true", "yes"}:
-        print(
-            "GEEFLIP: Skipping Playwright Chromium bootstrap (SKIP_PLAYWRIGHT_INSTALL=1).",
-            flush=True,
-        )
-        return
-
-    with _PLAYWRIGHT_CHROMIUM_LOCK:
-        if _PLAYWRIGHT_CHROMIUM_READY:
-            return
-
-        try:
-            from playwright.sync_api import sync_playwright as _sync_playwright
-        except Exception as exc:
-            print(f"GEEFLIP: Playwright package not available yet: {exc}", flush=True)
-            print("GEEFLIP: Install dependencies first (requirements.txt includes playwright).", flush=True)
-            return
-
-        def probe() -> None:
-            with _sync_playwright() as playwright:
-                browser = _launch_chromium(playwright, headless=True)
-                browser.close()
-
-        try:
-            probe()
-            print("GEEFLIP: Playwright Chromium already installed.", flush=True)
-            _PLAYWRIGHT_CHROMIUM_READY = True
-            return
-        except Exception as exc:
-            print(
-                f"GEEFLIP: Playwright Chromium missing/unusable ({exc}); installing...",
-                flush=True,
-            )
-
-        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.stdout:
-                print(proc.stdout, flush=True)
-            if proc.returncode != 0:
-                if proc.stderr:
-                    print(proc.stderr, flush=True)
-                print(
-                    f"GEEFLIP: Playwright install failed with exit code {proc.returncode}.",
-                    flush=True,
-                )
-                return
-            print("GEEFLIP: Playwright Chromium installation complete.", flush=True)
-        except Exception as exc:
-            print(f"GEEFLIP: Failed to run Playwright install command: {exc}", flush=True)
-            return
-
-        try:
-            probe()
-            print("GEEFLIP: Playwright Chromium is ready.", flush=True)
-            _PLAYWRIGHT_CHROMIUM_READY = True
-        except Exception as exc:
-            print(f"GEEFLIP: Chromium still unusable after install ({exc})", flush=True)
-
-
-def is_browser_crash(error: BaseException) -> bool:
-    text = str(error).casefold()
-    return any(
-        needle in text
-        for needle in (
-            "target crashed",
-            "target closed",
-            "browser has been closed",
-            "browser closed",
-            "page crashed",
-        )
+def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
+    browser = playwright.chromium.launch(
+        headless=headless,
+        channel="chrome",
+        args=BROWSER_ARGS,
     )
-
-
-def _chromium_launch_args(*, headless: bool) -> list[str]:
-    args = list(BROWSER_ARGS)
-    if headless or os.name != "nt":
-        args.extend(LINUX_BROWSER_ARGS)
-    return args
-
-
-def _launch_chromium(playwright, *, headless: bool):
-    kwargs = {
-        "args": _chromium_launch_args(headless=headless),
-        "chromium_sandbox": False,
-        "handle_sigint": False,
-        "handle_sigterm": False,
-        "handle_sighup": False,
-    }
-    if headless:
-        return playwright.chromium.launch(
-            headless=True,
-            channel="chromium",
-            **kwargs,
-        )
-    return playwright.chromium.launch(headless=False, **kwargs)
-
-
-def launch_ebay_browser(playwright, *, headless: bool = False):
-    last_error = None
-    for attempt in range(1, BROWSER_WARMUP_ATTEMPTS + 1):
-        browser = None
-        context = None
-        try:
-            browser = _launch_chromium(playwright, headless=headless)
-            context = create_browser_context(
-                browser,
-                headless=headless,
-            )
-            page = context.new_page()
-            warm_up_session(page, headless=headless)
-            return browser, context, page
-        except Exception as error:
-            last_error = error
-            close_ebay_browser(browser, context)
-            if not is_browser_crash(error) or attempt >= BROWSER_WARMUP_ATTEMPTS:
-                raise
-            print(
-                f"Browser crashed during warmup (attempt {attempt}/"
-                f"{BROWSER_WARMUP_ATTEMPTS}): {error}",
-                flush=True,
-            )
-            time.sleep(BROWSER_RESTART_PAUSE_SECONDS)
-    raise last_error
+    context = create_browser_context(browser, cookies=cookies)
+    page = context.new_page()
+    warm_up_session(page)
+    return browser, context, page
 
 
 def close_ebay_browser(browser, context) -> None:
@@ -1381,8 +1343,9 @@ def close_ebay_browser(browser, context) -> None:
 
 
 class EbayBrowserSession:
-    def __init__(self, playwright, *, headless: bool = False):
+    def __init__(self, playwright, cookies: list[dict], *, headless: bool = False):
         self._playwright = playwright
+        self._cookies = cookies
         self._headless = headless
         self.browser = None
         self.context = None
@@ -1392,6 +1355,7 @@ class EbayBrowserSession:
     def start(self) -> None:
         self.browser, self.context, self.page = launch_ebay_browser(
             self._playwright,
+            self._cookies,
             headless=self._headless,
         )
 
@@ -1410,11 +1374,17 @@ class EbayBrowserSession:
 @contextmanager
 def browser_session(
     *,
+    cookies: list[dict] | None = None,
+    cookie_header: str | None = None,
+    cookies_file: Path | None = None,
+    default_cookies_file: Path | None = None,
     headless: bool = False,
 ) -> Iterator[EbayBrowserSession]:
-    ensure_playwright_chromium_installed()
+    del cookie_header, cookies_file, default_cookies_file
+    session_cookies = cookies if cookies is not None else []
+
     with sync_playwright() as playwright:
-        session = EbayBrowserSession(playwright, headless=headless)
+        session = EbayBrowserSession(playwright, session_cookies, headless=headless)
         try:
             yield session
         finally:
@@ -1422,34 +1392,23 @@ def browser_session(
 
 
 def fetch_search_page(page: Page, url: str) -> PageFetchResult:
-    response = goto_ebay(page, url)
+    response = page.goto(
+        url,
+        wait_until="commit",
+        timeout=0,
+    )
     try:
         page.wait_for_selector(
             SEARCH_READY_SELECTOR,
             timeout=RESULTS_SELECTOR_TIMEOUT_MS,
-            state="attached",
         )
         html = page.content()
-    except PlaywrightTimeoutError as error:
-        try:
-            html = page.content()
-        except Exception:
-            html = ""
-        tree = HTMLParser(html)
-        if not (
-            has_zero_search_results(tree)
-            or has_no_exact_search_results(tree)
-            or html_has_listing_cards(tree)
-        ):
-            log_page_debug(
-                reason="search selector timeout",
-                error=error,
-                html=html,
-                url=page.url,
-                page=page,
-            )
+    except PlaywrightTimeoutError:
+        html = page.content()
+        if not has_zero_search_results(HTMLParser(html)):
             raise
 
+    assert_ship_to_us_html(html)
     status_code = response.status if response is not None else 0
     result = PageFetchResult(
         url=url,
@@ -1471,19 +1430,11 @@ def first_listing_image_url(page: Page, listings: list[dict] | None = None) -> s
 
 def _wait_for_search_cards(page: Page, timeout_ms: int) -> None:
     try:
-        page.wait_for_selector(
-            VISUAL_SEARCH_READY_SELECTOR,
-            timeout=timeout_ms,
-            state="attached",
-        )
+        page.wait_for_selector(VISUAL_SEARCH_READY_SELECTOR, timeout=timeout_ms)
     except PlaywrightTimeoutError:
         html = page.content()
         tree = HTMLParser(html)
-        if (
-            has_zero_search_results(tree)
-            or has_no_exact_search_results(tree)
-            or html_has_listing_cards(tree)
-        ):
+        if has_zero_search_results(tree) or has_no_exact_search_results(tree):
             return
         raise
 
@@ -1506,7 +1457,7 @@ def wait_for_visual_search_results(page: Page) -> str:
     if page.url != filtered:
         print(f"Image search URL:\n  {page.url}")
         print(f"Reloading with required filters:\n  {filtered}")
-        goto_ebay(page, filtered)
+        page.goto(filtered, wait_until="commit", timeout=0)
         print(f"Filtered image search URL:\n  {page.url}")
     else:
         print("Image search URL already has LH_BIN, LH_ItemCondition, LH_PrefLoc.")
@@ -1568,6 +1519,7 @@ def scrape_image_search_page(
         search_url = run_visual_search(page, image_url)
         result["search_url"] = search_url
         html = page.content()
+        assert_ship_to_us_html(html)
         analyze_page(
             search_url,
             PageFetchResult(
@@ -1583,11 +1535,9 @@ def scrape_image_search_page(
             final_url=page.url,
             status_code=200,
         )
-    except EbayBlockedError as error:
-        return _blocked_search_result(result, error)
-    except PlaywrightTimeoutError as error:
-        result["error"] = str(error)
-        return result
+    except Exception as error:
+        log_page_debug(reason="image search failed", error=error, page=page)
+        raise
 
 
 def scrape_search_page(
@@ -1610,32 +1560,9 @@ def scrape_search_page(
             final_url=fetch_result.final_url,
             status_code=fetch_result.status_code,
         )
-    except EbayBlockedError as error:
-        log_page_debug(
-            reason="blocked search page",
-            error=error,
-            url=url,
-            page=page,
-        )
-        return _blocked_search_result(result, error)
-    except PlaywrightTimeoutError as error:
-        log_page_debug(
-            reason="search page timeout",
-            error=error,
-            url=url,
-            page=page,
-        )
-        result["error"] = str(error)
-        return result
     except Exception as error:
-        log_page_debug(
-            reason="search page exception",
-            error=error,
-            url=url,
-            page=page,
-        )
-        result["error"] = f"{type(error).__name__}: {error}"
-        return result
+        log_page_debug(reason="search page failed", error=error, page=page)
+        raise
 
 
 def scrape_search_page_from_html(
@@ -1651,6 +1578,7 @@ def scrape_search_page_from_html(
         url, title=title, asin=asin, ean=ean, buybox_price=buybox_price
     )
     try:
+        assert_ship_to_us_html(html)
         analyze_page(
             url,
             PageFetchResult(url=url, final_url=url, status_code=200, html=html),

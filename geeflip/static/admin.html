@@ -29,14 +29,21 @@
     <main class="stage full">
       <section class="page-toolbar">
         <div>
-          <h2>eBay session</h2>
-          <p>Guest browser on the US host. No cookies are loaded.</p>
+          <h2>eBay cookie</h2>
+          <p id="cookie-status">Loading…</p>
         </div>
       </section>
       <section class="sheet admin-card">
-        <p class="admin-copy">Scrapes open a fresh Playwright session and do not reuse a pasted eBay cookie.</p>
+        <p class="admin-copy">Paste a <code>Cookie</code> header to keep a local copy. It is not committed and the scraper does not load it; searches open eBay as a guest.</p>
+        <textarea id="cookie-input" rows="10" placeholder="nonsession=...; dp1=...; s=..."></textarea>
+        <div class="admin-actions">
+          <button type="button" class="go small" id="save-cookie">Save cookie</button>
+          <span id="cookie-save-msg"></span>
+        </div>
       </section>
     </main>
   </div>
+  <script src="/static/js/common.js"></script>
+  <script src="/static/js/admin.js"></script>
 </body>
 </html>

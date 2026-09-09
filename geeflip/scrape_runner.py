@@ -16,6 +16,7 @@ if str(EBAY_ROOT) not in sys.path:
 from lib.paths import COMBINED_XLSX
 from scripts.scrape_listings import ScrapeSettings, main as scrape_main, select_products
 
+from cookies import cookie_status
 from db import DEFAULT_FILTERS, GeeflipStore
 
 
@@ -148,6 +149,7 @@ def settings_from_filters(
         skip_previously_won=data["skip_previously_won"],
         winner_history_retention_days=data["winner_history_retention_days"],
         identifier_no_match_retention_days=data["identifier_no_match_retention_days"],
+        cookies_file=None,
         headless=True,
         write_xlsx=False,
         write_json=False,
@@ -170,20 +172,10 @@ class ScrapeRunner:
         self.finished_at: str | None = None
         self.logs: deque[dict[str, Any]] = deque(maxlen=5000)
         self.log_id = 0
-        self._wake = threading.Event()
 
     @property
     def running(self) -> bool:
         return self.status in {"running", "stopping"}
-
-    def _notify(self) -> None:
-        self._wake.set()
-
-    def wait_for_update(self, timeout: float = 1.0) -> bool:
-        fired = self._wake.wait(timeout)
-        if fired:
-            self._wake.clear()
-        return fired
 
     def emit(self, line: str) -> None:
         with self._lock:
@@ -194,7 +186,6 @@ class ScrapeRunner:
                 "ts": datetime.now().isoformat(timespec="seconds"),
             }
             self.logs.append(item)
-        self._notify()
 
     def logs_after(self, after_id: int) -> list[dict[str, Any]]:
         with self._lock:
@@ -214,6 +205,7 @@ class ScrapeRunner:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "playwright": "headless",
+            "cookies": cookie_status()["present"],
             "catalog": catalog,
             "winners_total": self.store.winner_count(),
             "winners_run": self.store.winner_count(run_id=run_id) if run_id else 0,
@@ -259,7 +251,6 @@ class ScrapeRunner:
             daemon=True,
         )
         self._thread.start()
-        self._notify()
         return self.snapshot()
 
     def stop(self) -> dict[str, Any]:
@@ -276,9 +267,6 @@ class ScrapeRunner:
         error = None
         try:
             sys.stdout = _LogTee(stdout, self.emit, thread_id=threading.get_ident())
-            from lib.ebay_scraper import ensure_playwright_chromium_installed
-
-            ensure_playwright_chromium_installed()
             exit_code = scrape_main(settings)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
