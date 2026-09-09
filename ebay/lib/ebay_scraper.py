@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,14 +11,14 @@ from typing import Iterator
 from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 from selectolax.parser import HTMLParser
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+import image_search
+
 PAGE_TIMEOUT_MS = 25_000
 RESULTS_SELECTOR_TIMEOUT_MS = 4_000
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+VISUAL_SEARCH_RESULTS_TIMEOUT_MS = 8_000
 
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -72,6 +73,9 @@ RESULT_MARKERS = (
 RESULTS_WAIT_SELECTOR = ".srp-river-results li.s-card, .srp-river-results .s-item-card"
 NO_EXACT_MATCH_SELECTOR = ".srp-save-null-search__heading"
 SEARCH_READY_SELECTOR = f"{RESULTS_WAIT_SELECTOR}, {NO_EXACT_MATCH_SELECTOR}"
+VISUAL_SEARCH_READY_SELECTOR = (
+    f"{SEARCH_READY_SELECTOR}, li.s-card[data-listingid]"
+)
 SELLER_CARD_SELECTOR = ".x-sellercard-atf__avatar-info"
 RESULTS_LIST_SELECTORS = ("ul.srp-results", ".srp-river-results")
 INTERNATIONAL_DIVIDER_CLASS = "srp-river-answer--REWRITE_START"
@@ -82,6 +86,11 @@ SHIP_TO_WAIT_TIMEOUT_MS = 8_000
 SHIP_TO_RETRY_WAIT_SECONDS = 3.0
 MIN_RESULTS_PAGE_BYTES = 10_000
 BODY_PREVIEW_CHARS = 500
+NEW_LISTING_SELECTOR = "span.s-card__new-listing"
+EBAYIMG_URL_RE = re.compile(
+    r"https://i\.ebayimg\.com/images/g/[^/\s,]+/s-l\d+\.(?:webp|jpg)",
+    re.IGNORECASE,
+)
 
 PRICE_RE = re.compile(r"\$\s*([\d,]+(?:\.\d{2})?)")
 PLAIN_PRICE_RE = re.compile(r"^\s*([\d,]+(?:\.\d{1,2})?)\s*$")
@@ -834,6 +843,32 @@ def extract_domestic_listing_cards(tree: HTMLParser) -> list:
     return nested_cards if nested_cards else results_list.css(".s-item-card")
 
 
+def to_s_l500(url: str) -> str:
+    return image_search.to_s_l500(url)
+
+
+def extract_card_image_url(card) -> str:
+    blobs: list[str] = []
+    for img in card.css("img.s-card__image"):
+        blobs.append(
+            " ".join(
+                value
+                for value in (
+                    img.attributes.get("data-defer-load"),
+                    img.attributes.get("src"),
+                    img.attributes.get("data-src"),
+                    img.attributes.get("srcset"),
+                )
+                if value
+            )
+        )
+    for blob in blobs:
+        match = EBAYIMG_URL_RE.search(blob)
+        if match:
+            return to_s_l500(match.group(0))
+    return ""
+
+
 def extract_search_listings(html: str) -> list[dict[str, str]]:
     tree = HTMLParser(html)
     if has_zero_search_results(tree) or has_no_exact_search_results(tree):
@@ -879,6 +914,8 @@ def extract_search_listings(html: str) -> list[dict[str, str]]:
         shipping_text, shipping_value = extract_shipping(attr_rows)
         listing_price_value = parse_price(price_text)
         seller_name, seller_reviews_count = extract_seller(card)
+        image_url = extract_card_image_url(card)
+        is_new_listing = card.css_first(NEW_LISTING_SELECTOR) is not None
 
         listings.append(
             {
@@ -902,6 +939,8 @@ def extract_search_listings(html: str) -> list[dict[str, str]]:
                     if inferred_listing_date is not None
                     else ""
                 ),
+                "image_url": image_url,
+                "is_new_listing": is_new_listing,
             }
         )
 
@@ -1178,16 +1217,7 @@ def create_browser_context(browser: Browser, *, cookies: list[dict] | None = Non
     context = browser.new_context(
         locale="en-US",
         timezone_id="America/New_York",
-        user_agent=USER_AGENT,
-        viewport={"width": 1366, "height": 768},
-        extra_http_headers={
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,*/*;q=0.8"
-            ),
-            "Upgrade-Insecure-Requests": "1",
-        },
+        viewport={"width": 1440, "height": 900},
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
     apply_cookies_to_context(context, cookies or [])
@@ -1214,9 +1244,10 @@ def warm_up_session(page: Page) -> None:
         verify_ship_to_us(page)
 
 
-def launch_ebay_browser(playwright, cookies: list[dict]):
+def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
     browser = playwright.chromium.launch(
-        headless=False,
+        headless=headless,
+        channel="chrome",
         args=BROWSER_ARGS,
     )
     context = create_browser_context(browser, cookies=cookies)
@@ -1239,9 +1270,10 @@ def close_ebay_browser(browser, context) -> None:
 
 
 class EbayBrowserSession:
-    def __init__(self, playwright, cookies: list[dict]):
+    def __init__(self, playwright, cookies: list[dict], *, headless: bool = False):
         self._playwright = playwright
         self._cookies = cookies
+        self._headless = headless
         self.browser = None
         self.context = None
         self.page = None
@@ -1251,6 +1283,7 @@ class EbayBrowserSession:
         self.browser, self.context, self.page = launch_ebay_browser(
             self._playwright,
             self._cookies,
+            headless=self._headless,
         )
 
     def close(self) -> None:
@@ -1272,6 +1305,7 @@ def browser_session(
     cookie_header: str | None = None,
     cookies_file: Path | None = None,
     default_cookies_file: Path | None = None,
+    headless: bool = False,
 ) -> Iterator[EbayBrowserSession]:
     if cookies is None:
         cookies = load_ebay_cookies(
@@ -1281,7 +1315,7 @@ def browser_session(
         )
 
     with sync_playwright() as playwright:
-        session = EbayBrowserSession(playwright, cookies)
+        session = EbayBrowserSession(playwright, cookies, headless=headless)
         try:
             yield session
         finally:
@@ -1315,6 +1349,128 @@ def fetch_search_page(page: Page, url: str) -> PageFetchResult:
     )
     analyze_page(url, result)
     return result
+
+
+def first_listing_image_url(page: Page, listings: list[dict] | None = None) -> str:
+    for listing in listings or []:
+        url = str(listing.get("image_url") or "").strip()
+        if url and "i.ebayimg.com" in url and not url.startswith("data:"):
+            return to_s_l500(url)
+    return image_search.first_listing_image(page)
+
+
+def _wait_for_search_cards(page: Page, timeout_ms: int) -> None:
+    try:
+        page.wait_for_selector(VISUAL_SEARCH_READY_SELECTOR, timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        html = page.content()
+        tree = HTMLParser(html)
+        if has_zero_search_results(tree) or has_no_exact_search_results(tree):
+            return
+        raise
+
+
+def wait_for_visual_search_results(page: Page) -> str:
+    try:
+        page.wait_for_url(
+            re.compile(r"visualSearchGuid="),
+            wait_until="commit",
+            timeout=image_search.NAV_TIMEOUT_MS,
+        )
+    except PlaywrightTimeoutError:
+        page.wait_for_url(
+            "**/sch/**",
+            wait_until="commit",
+            timeout=image_search.NAV_TIMEOUT_MS,
+        )
+
+    filtered = image_search.ensure_filter_suffix(page.url)
+    if page.url != filtered:
+        print(f"Image search URL:\n  {page.url}")
+        print(f"Reloading with required filters:\n  {filtered}")
+        page.goto(filtered, wait_until="commit", timeout=0)
+        print(f"Filtered image search URL:\n  {page.url}")
+    else:
+        print("Image search URL already has LH_BIN, LH_ItemCondition, LH_PrefLoc.")
+
+    image_search.dismiss_overlays(page)
+    _wait_for_search_cards(page, VISUAL_SEARCH_RESULTS_TIMEOUT_MS)
+    print("Visual search listings loaded.")
+    return page.url
+
+
+def run_visual_search(page: Page, image_url: str) -> str:
+    image_search.dismiss_overlays(page)
+
+    camera = page.locator(
+        'button.gh-search-input__camera-btn, button[aria-label="Camera icon"]'
+    ).first
+    camera.wait_for(state="visible")
+    camera.click()
+
+    dialog = page.get_by_role(
+        "dialog",
+        name="Can't find the words? Search with an image",
+    )
+    dialog.wait_for(state="visible")
+
+    url_input = dialog.locator(
+        'input[aria-label="Image URL link input"], input[placeholder="Paste an image link"]'
+    ).first
+    url_input.wait_for(state="visible")
+    url_input.click()
+    image_search.fill_image_url(url_input, image_url, page)
+
+    go_btn = dialog.locator(
+        "button.visual-search-modal__go-btn, button:has-text('Go')"
+    ).first
+    go_btn.click()
+
+    return wait_for_visual_search_results(page)
+
+
+def scrape_image_search_page(
+    page: Page,
+    image_url: str,
+    *,
+    title: str = "",
+    asin: str = "",
+    ean: str = "",
+    buybox_price: str = "",
+) -> dict:
+    result = _empty_search_result(
+        "",
+        title=title,
+        asin=asin,
+        ean=ean,
+        buybox_price=buybox_price,
+    )
+    result["search_source"] = "image_search"
+    try:
+        search_url = run_visual_search(page, image_url)
+        result["search_url"] = search_url
+        html = page.content()
+        assert_ship_to_us_html(html)
+        analyze_page(
+            search_url,
+            PageFetchResult(
+                url=search_url,
+                final_url=page.url,
+                status_code=200,
+                html=html,
+            ),
+        )
+        return _fill_search_result(
+            result,
+            html,
+            final_url=page.url,
+            status_code=200,
+        )
+    except EbayBlockedError as error:
+        return _blocked_search_result(result, error)
+    except PlaywrightTimeoutError as error:
+        result["error"] = str(error)
+        return result
 
 
 def scrape_search_page(

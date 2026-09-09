@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GEEFLIP — Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+  <div class="app page">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>GEEFLIP</h1>
+          <p>Admin</p>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="/">Scrape</a>
+        <a href="/asins">ASINs</a>
+        <a href="/history">History</a>
+        <a href="/admin" class="active">Admin</a>
+      </nav>
+    </header>
+    <main class="stage full">
+      <section class="page-toolbar">
+        <div>
+          <h2>eBay cookie</h2>
+          <p id="cookie-status">Loading…</p>
+        </div>
+      </section>
+      <section class="sheet admin-card">
+        <p class="admin-copy">Paste the full <code>Cookie</code> header from an eBay browser session. Saving it updates the file the headless scraper uses.</p>
+        <textarea id="cookie-input" rows="10" placeholder="nonsession=...; dp1=...; s=..."></textarea>
+        <div class="admin-actions">
+          <button type="button" class="go small" id="save-cookie">Save cookie</button>
+          <span id="cookie-save-msg"></span>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/js/common.js"></script>
+  <script src="/static/js/admin.js"></script>
+</body>
+</html>

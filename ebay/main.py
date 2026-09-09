@@ -33,12 +33,15 @@ SETTINGS = ScrapeSettings(
     min_roi_percent=80,
     max_roi_percent=300,
     max_listing_age_days=2,
-    min_seller_reviews=50,
+    min_seller_reviews=40,
     max_sales_rank=500_000,
     min_buybox_price=40.00,
 
     # Search EAN, and also UPC when it is different.
     upc_as_well=True,
+
+    # After each UPC/EAN search, image-search from the first listing photo.
+    image_search=False,
 )
 
 

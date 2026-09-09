@@ -1,10 +1,13 @@
-# eBay session cookies — never commit
-ebay/data/input/ebay_cookies.txt
 .env
 .env.*
 
 # Browser profiles hold cookies/session data
 **/data/browser/
+
+# GEEFLIP local database
+geeflip/data/*.db
+geeflip/data/*.db-*
+!geeflip/data/ebay_cookies.txt
 
 # Python
 __pycache__/

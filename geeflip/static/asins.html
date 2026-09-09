@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GEEFLIP — ASINs</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+  <div class="app page">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>GEEFLIP</h1>
+          <p>Catalog</p>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="/">Scrape</a>
+        <a href="/asins" class="active">ASINs</a>
+        <a href="/history">History</a>
+        <a href="/admin">Admin</a>
+      </nav>
+    </header>
+    <main class="stage full">
+      <section class="page-toolbar">
+        <div>
+          <h2>All ASINs</h2>
+          <p id="asins-count">Loading catalog…</p>
+        </div>
+        <form id="asins-search">
+          <input type="search" name="q" placeholder="Search ASIN, title, brand, EAN" autocomplete="off">
+          <button type="submit" class="go small">Search</button>
+        </form>
+      </section>
+      <section class="sheet">
+        <div class="table-scroll tall">
+          <table>
+            <thead>
+              <tr>
+                <th>Photo</th>
+                <th>Row</th>
+                <th>ASIN</th>
+                <th>Title</th>
+                <th>Brand</th>
+                <th>Buy box</th>
+                <th>Sales rank</th>
+                <th>Mismatches</th>
+                <th>Link</th>
+              </tr>
+            </thead>
+            <tbody id="asins-body">
+              <tr class="empty"><td colspan="9">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button type="button" class="text-btn" id="asins-prev">Previous</button>
+          <span id="asins-page">—</span>
+          <button type="button" class="text-btn" id="asins-next">Next</button>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/js/common.js"></script>
+  <script src="/static/js/asins.js"></script>
+</body>
+</html>
