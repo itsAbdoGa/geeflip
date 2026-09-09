@@ -39,7 +39,7 @@ BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
 BROWSER_WARMUP_ATTEMPTS = 3
 CHALLENGE_WAIT_TIMEOUT_MS = 8_000
-PRODUCTION_SEARCH_PAUSE_SECONDS = 2.0
+DOM_PRINT_CHARS = 80_000
 HEAVY_ASSET_RE = re.compile(
     r".*\.(?:png|jpe?g|gif|webp|svg|avif|ico|woff2?|ttf|otf|mp4|webm)(?:\?.*)?$",
     re.I,
@@ -1403,6 +1403,90 @@ def page_is_ebay_challenge(page: Page) -> bool:
     return "pardon our interruption" in title
 
 
+def _page_snapshot(page: Page | None) -> dict[str, str]:
+    url = ""
+    title = ""
+    html = ""
+    if page is not None:
+        try:
+            url = page.url or ""
+        except Exception:
+            url = ""
+        try:
+            title = page.title() or ""
+        except Exception:
+            title = ""
+        try:
+            html = page.content() or ""
+        except Exception as error:
+            html = f"<!-- could not read DOM: {type(error).__name__}: {error} -->"
+    lowered = f"{url}\n{title}\n{html}".casefold()
+    tree = HTMLParser(html)
+    body = tree.css_first("body")
+    body_html = body.html if body is not None else html
+    return {
+        "url": url,
+        "title": title,
+        "html": html,
+        "body_html": body_html or "",
+        "bytes": str(len(html.encode("utf-8", errors="replace"))),
+        "splashui": "yes" if "splashui" in lowered else "no",
+        "pardon": "yes" if "pardon our interruption" in lowered else "no",
+        "checking_browser": "yes" if "checking your browser" in lowered else "no",
+        "captcha": "yes" if any(m in lowered for m in ("captcha", "hcaptcha", "recaptcha")) else "no",
+        "ebay_header": "yes" if ("id=\"gh\"" in html or "class=\"gh-" in html or 'id="gh"' in html) else "no",
+        "s_card": str(len(tree.css("li.s-card"))),
+    }
+
+
+def homepage_loaded_successfully(snapshot: dict[str, str]) -> bool:
+    url = (snapshot.get("url") or "").casefold()
+    if "splashui" in url or "/challenge" in url:
+        return False
+    if "ebay.com" not in url:
+        return False
+    if snapshot.get("pardon") == "yes" or snapshot.get("checking_browser") == "yes":
+        return False
+    try:
+        html_bytes = int(snapshot.get("bytes") or "0")
+    except ValueError:
+        html_bytes = 0
+    if html_bytes < 8_000:
+        return False
+    title = (snapshot.get("title") or "").casefold()
+    return "ebay" in title or snapshot.get("ebay_header") == "yes"
+
+
+def print_page_dom(page: Page | None, *, label: str) -> dict[str, str]:
+    snapshot = _page_snapshot(page)
+    print(f"----- DOM {label} -----", flush=True)
+    print(f"url: {snapshot['url']}", flush=True)
+    print(f"title: {snapshot['title']}", flush=True)
+    print(
+        f"markers: splashui={snapshot['splashui']} "
+        f"pardon={snapshot['pardon']} "
+        f"checking_browser={snapshot['checking_browser']} "
+        f"captcha={snapshot['captcha']} "
+        f"ebay_header={snapshot['ebay_header']} "
+        f"s-card={snapshot['s_card']} "
+        f"html_bytes={snapshot['bytes']}",
+        flush=True,
+    )
+    body_html = snapshot["body_html"]
+    if len(body_html) > DOM_PRINT_CHARS:
+        print(
+            f"body DOM ({len(body_html)} chars, truncated to {DOM_PRINT_CHARS}):\n"
+            f"{body_html[:DOM_PRINT_CHARS]}\n----- end DOM {label} (truncated) -----",
+            flush=True,
+        )
+    else:
+        print(
+            f"body DOM ({len(body_html)} chars):\n{body_html}\n----- end DOM {label} -----",
+            flush=True,
+        )
+    return snapshot
+
+
 def wait_out_ebay_challenge(
     page: Page,
     *,
@@ -1416,7 +1500,8 @@ def wait_out_ebay_challenge(
             raise
         return False
 
-    print("eBay bot-check splash detected; restarting if it does not clear quickly...", flush=True)
+    print("eBay bot-check splash detected; dumping DOM to confirm, then waiting briefly...", flush=True)
+    print_page_dom(page, label="ebay bot-check")
     deadline = time.monotonic() + (timeout_ms / 1000)
     last_url = ""
     while time.monotonic() < deadline:
@@ -1510,7 +1595,15 @@ def warm_up_session(page: Page) -> None:
     print("Opening https://www.ebay.com/ before scraping listings", flush=True)
     try:
         goto_ebay(page, "https://www.ebay.com/")
-        print(f"Homepage warmup landed on {page.url}", flush=True)
+        snapshot = print_page_dom(page, label="ebay.com warmup")
+        if homepage_loaded_successfully(snapshot):
+            print("INDICATOR: ebay.com SUCCESSFULLY LOADED", flush=True)
+        else:
+            print(
+                "INDICATOR: ebay.com DID NOT load a real homepage "
+                f"(url={snapshot['url']!r} title={snapshot['title']!r})",
+                flush=True,
+            )
         time.sleep(2)
         if is_production():
             print("Production scrape: skipping ship-to US check", flush=True)
