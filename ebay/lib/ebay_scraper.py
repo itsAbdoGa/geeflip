@@ -84,7 +84,11 @@ RESULT_MARKERS = (
     "srp-save-null-search",
 )
 
-RESULTS_WAIT_SELECTOR = ".srp-river-results li.s-card, .srp-river-results .s-item-card"
+RESULTS_WAIT_SELECTOR = (
+    ".srp-river-results li.s-card[data-listingid], "
+    ".srp-river-results li.s-card, "
+    ".srp-river-results .s-item-card"
+)
 NO_EXACT_MATCH_SELECTOR = ".srp-save-null-search__heading"
 SEARCH_READY_SELECTOR = f"{RESULTS_WAIT_SELECTOR}, {NO_EXACT_MATCH_SELECTOR}"
 VISUAL_SEARCH_READY_SELECTOR = (
@@ -828,6 +832,14 @@ def has_no_exact_search_results(tree: HTMLParser) -> bool:
     return "no exact matches found" in heading.text(separator=" ", strip=True).casefold()
 
 
+def html_has_listing_cards(tree: HTMLParser) -> bool:
+    return bool(
+        tree.css("li.s-card[data-listingid]")
+        or tree.css(".srp-river-results li.s-card")
+        or tree.css(".s-item-card")
+    )
+
+
 def iter_direct_element_children(node):
     child = node.child
     while child:
@@ -1495,11 +1507,17 @@ def fetch_search_page(page: Page, url: str) -> PageFetchResult:
         page.wait_for_selector(
             SEARCH_READY_SELECTOR,
             timeout=RESULTS_SELECTOR_TIMEOUT_MS,
+            state="attached",
         )
         html = page.content()
     except PlaywrightTimeoutError:
         html = page.content()
-        if not has_zero_search_results(HTMLParser(html)):
+        tree = HTMLParser(html)
+        if not (
+            has_zero_search_results(tree)
+            or has_no_exact_search_results(tree)
+            or html_has_listing_cards(tree)
+        ):
             raise
 
     assert_ship_to_us_html(html)
@@ -1524,11 +1542,19 @@ def first_listing_image_url(page: Page, listings: list[dict] | None = None) -> s
 
 def _wait_for_search_cards(page: Page, timeout_ms: int) -> None:
     try:
-        page.wait_for_selector(VISUAL_SEARCH_READY_SELECTOR, timeout=timeout_ms)
+        page.wait_for_selector(
+            VISUAL_SEARCH_READY_SELECTOR,
+            timeout=timeout_ms,
+            state="attached",
+        )
     except PlaywrightTimeoutError:
         html = page.content()
         tree = HTMLParser(html)
-        if has_zero_search_results(tree) or has_no_exact_search_results(tree):
+        if (
+            has_zero_search_results(tree)
+            or has_no_exact_search_results(tree)
+            or html_has_listing_cards(tree)
+        ):
             return
         raise
 
