@@ -118,19 +118,6 @@ function renderWinners(payload) {
     .join("");
 }
 
-async function refreshStatus() {
-  const snapshot = await fetchJson("/api/status");
-  setStatus(snapshot);
-  return snapshot;
-}
-
-async function refreshWinners(snapshot) {
-  const runId = snapshot?.run_id;
-  const query = snapshot?.status === "running" && runId ? `?run_id=${runId}` : "";
-  const payload = await fetchJson(`/api/winners${query}`);
-  renderWinners(payload);
-}
-
 async function previewFilters() {
   try {
     const payload = await fetchJson("/api/preview", {
@@ -144,25 +131,36 @@ async function previewFilters() {
   }
 }
 
-let logSource = null;
+let liveSocket = null;
+let reconnectTimer = null;
 
-function connectLogs() {
-  if (logSource) {
-    logSource.close();
-    logSource = null;
+function connectLive() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
-  logSource = new EventSource(`/api/scrape/logs?after=${lastLogId}`);
-  logSource.onmessage = (event) => {
-    const item = JSON.parse(event.data);
-    lastLogId = item.id;
-    appendLog(item);
-  };
-  logSource.onerror = () => {
-    if (logSource) {
-      logSource.close();
-      logSource = null;
+  if (liveSocket) {
+    liveSocket.onclose = null;
+    liveSocket.close();
+    liveSocket = null;
+  }
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  liveSocket = new WebSocket(`${protocol}//${location.host}/ws/live?after=${lastLogId}`);
+  liveSocket.onmessage = (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "logs") {
+      for (const item of message.logs || []) {
+        lastLogId = Math.max(lastLogId, item.id || 0);
+        appendLog(item);
+      }
+    } else if (message.type === "status") {
+      setStatus(message.status);
+    } else if (message.type === "winners") {
+      renderWinners(message);
     }
-    setTimeout(connectLogs, 1200);
+  };
+  liveSocket.onclose = () => {
+    reconnectTimer = setTimeout(connectLive, 1500);
   };
 }
 
@@ -208,14 +206,8 @@ async function boot() {
   bindSeenClicks(winnersBody);
   const filters = await fetchJson("/api/filters");
   fillFilters(filters);
-  const snapshot = await refreshStatus();
-  await refreshWinners(snapshot);
   await previewFilters();
-  connectLogs();
-  setInterval(async () => {
-    const next = await refreshStatus();
-    await refreshWinners(next);
-  }, 2000);
+  connectLive();
 }
 
 boot().catch((error) => {

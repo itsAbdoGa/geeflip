@@ -172,10 +172,20 @@ class ScrapeRunner:
         self.finished_at: str | None = None
         self.logs: deque[dict[str, Any]] = deque(maxlen=5000)
         self.log_id = 0
+        self._wake = threading.Event()
 
     @property
     def running(self) -> bool:
         return self.status in {"running", "stopping"}
+
+    def _notify(self) -> None:
+        self._wake.set()
+
+    def wait_for_update(self, timeout: float = 1.0) -> bool:
+        fired = self._wake.wait(timeout)
+        if fired:
+            self._wake.clear()
+        return fired
 
     def emit(self, line: str) -> None:
         with self._lock:
@@ -186,6 +196,7 @@ class ScrapeRunner:
                 "ts": datetime.now().isoformat(timespec="seconds"),
             }
             self.logs.append(item)
+        self._notify()
 
     def logs_after(self, after_id: int) -> list[dict[str, Any]]:
         with self._lock:
@@ -251,6 +262,7 @@ class ScrapeRunner:
             daemon=True,
         )
         self._thread.start()
+        self._notify()
         return self.snapshot()
 
     def stop(self) -> dict[str, Any]:
