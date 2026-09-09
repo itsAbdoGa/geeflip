@@ -430,6 +430,8 @@ def is_ship_to_us_html(html: str) -> bool | None:
 
 
 def assert_ship_to_us_html(html: str) -> None:
+    if is_production():
+        return
     status = is_ship_to_us_html(html)
     if status is True:
         return
@@ -457,6 +459,8 @@ def _ship_to_aria_label(page: Page) -> str:
 
 def verify_ship_to_us(page: Page) -> None:
     """Ensure the header Ship to control shows the US flag (fl-us)."""
+    if is_production():
+        return
     try:
         page.wait_for_selector(
             SHIP_TO_CONTAINER_SELECTOR,
@@ -497,6 +501,8 @@ def verify_ship_to_us(page: Page) -> None:
 
 
 def refresh_and_verify_ship_to_us(page: Page) -> None:
+    if is_production():
+        return
     page.reload(
         wait_until="domcontentloaded",
         timeout=PAGE_TIMEOUT_MS,
@@ -1352,6 +1358,9 @@ def warm_up_session(page: Page) -> None:
             wait_until="domcontentloaded",
             timeout=0,
         )
+        if is_production():
+            print("Production scrape: skipping ship-to US check", flush=True)
+            return
         try:
             verify_ship_to_us(page)
             return
