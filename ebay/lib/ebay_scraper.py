@@ -104,6 +104,8 @@ SHIP_TO_WAIT_TIMEOUT_MS = 8_000
 SHIP_TO_RETRY_WAIT_SECONDS = 3.0
 MIN_RESULTS_PAGE_BYTES = 10_000
 BODY_PREVIEW_CHARS = 500
+HTML_DEBUG_CHARS = 12_000
+BODY_TEXT_DEBUG_CHARS = 2_500
 NEW_LISTING_SELECTOR = "span.s-card__new-listing"
 EBAYIMG_URL_RE = re.compile(
     r"https://i\.ebayimg\.com/images/g/[^/\s,]+/s-l\d+\.(?:webp|jpg)",
@@ -840,6 +842,55 @@ def html_has_listing_cards(tree: HTMLParser) -> bool:
     )
 
 
+def log_page_debug(
+    *,
+    reason: str,
+    error: BaseException | None = None,
+    html: str = "",
+    url: str = "",
+    page: Page | None = None,
+) -> None:
+    if page is not None:
+        try:
+            url = page.url or url
+        except Exception:
+            pass
+        if not html:
+            try:
+                html = page.content()
+            except Exception as read_error:
+                print(
+                    f"  DEBUG could not read page HTML ({type(read_error).__name__}: {read_error})",
+                    flush=True,
+                )
+                html = ""
+    tree = HTMLParser(html or "")
+    title_node = tree.css_first("title")
+    title = title_node.text(strip=True) if title_node is not None else ""
+    body = tree.css_first("body")
+    body_html = body.html if body is not None else (html or "")
+    body_text = " ".join(
+        (body.text(separator=" ", strip=True) if body is not None else "")[:4000].split()
+    )
+    ship = tree.css_first(SHIP_TO_CONTAINER_SELECTOR)
+    ship_html = (ship.html or "")[:800] if ship is not None else "(missing .gh-ship-to)"
+    print(f"  DEBUG {reason}", flush=True)
+    if error is not None:
+        print(f"  DEBUG exception: {type(error).__name__}: {error}", flush=True)
+    print(f"  DEBUG url: {url}", flush=True)
+    print(f"  DEBUG title: {title}", flush=True)
+    print(
+        f"  DEBUG html_bytes={len(html or '')} "
+        f"s-card={len(tree.css('li.s-card'))} "
+        f"listingid={len(tree.css('[data-listingid]'))} "
+        f"null-search={len(tree.css(NO_EXACT_MATCH_SELECTOR))}",
+        flush=True,
+    )
+    print(f"  DEBUG ship-to html: {ship_html}", flush=True)
+    print(f"  DEBUG body text: {body_text[:BODY_TEXT_DEBUG_CHARS]}", flush=True)
+    print(f"  DEBUG body html:\n{body_html[:HTML_DEBUG_CHARS]}", flush=True)
+
+
 def iter_direct_element_children(node):
     child = node.child
     while child:
@@ -1510,7 +1561,7 @@ def fetch_search_page(page: Page, url: str) -> PageFetchResult:
             state="attached",
         )
         html = page.content()
-    except PlaywrightTimeoutError:
+    except PlaywrightTimeoutError as error:
         html = page.content()
         tree = HTMLParser(html)
         if not (
@@ -1518,9 +1569,26 @@ def fetch_search_page(page: Page, url: str) -> PageFetchResult:
             or has_no_exact_search_results(tree)
             or html_has_listing_cards(tree)
         ):
+            log_page_debug(
+                reason="search selector timeout",
+                error=error,
+                html=html,
+                url=page.url,
+                page=page,
+            )
             raise
 
-    assert_ship_to_us_html(html)
+    try:
+        assert_ship_to_us_html(html)
+    except EbayShipToNotUsError as error:
+        log_page_debug(
+            reason="ship-to check failed after search load",
+            error=error,
+            html=html,
+            url=page.url,
+            page=page,
+        )
+        raise
     status_code = response.status if response is not None else 0
     result = PageFetchResult(
         url=url,
@@ -1683,9 +1751,32 @@ def scrape_search_page(
             status_code=fetch_result.status_code,
         )
     except EbayBlockedError as error:
+        log_page_debug(
+            reason="blocked search page",
+            error=error,
+            url=url,
+            page=page,
+        )
         return _blocked_search_result(result, error)
     except PlaywrightTimeoutError as error:
+        log_page_debug(
+            reason="search page timeout",
+            error=error,
+            url=url,
+            page=page,
+        )
         result["error"] = str(error)
+        return result
+    except EbayShipToNotUsError:
+        raise
+    except Exception as error:
+        log_page_debug(
+            reason="search page exception",
+            error=error,
+            url=url,
+            page=page,
+        )
+        result["error"] = f"{type(error).__name__}: {error}"
         return result
 
 

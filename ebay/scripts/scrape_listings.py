@@ -29,6 +29,7 @@ from lib.ebay_scraper import (
     format_cheapest_listing_log,
     is_browser_crash,
     load_ebay_cookies,
+    log_page_debug,
     parse_price,
     refresh_and_verify_ship_to_us,
     scrape_image_search_page,
@@ -1307,7 +1308,9 @@ def process_product(
     result = scrape_product_result(page, product, saved_html=saved_html)
     query_type = str(product.get("search_identifier_type") or "").upper()
     if query_type in {"EAN", "UPC"}:
-        if not result.get("listings"):
+        if result.get("error") or result.get("block_reason"):
+            pass
+        elif not result.get("listings"):
             if no_exact_match_callback is not None:
                 no_exact_match_callback(product)
         elif exact_match_callback is not None:
@@ -1386,6 +1389,11 @@ def process_live_product_with_ship_to_retry(
     except EbayShipToNotUsError as error:
         identifier_type, identifier = query_label(product)
         print(f"  Ship to is not US for {identifier_type} {identifier}: {error}")
+        log_page_debug(
+            reason="ship-to not US before refresh",
+            error=error,
+            page=page,
+        )
         print("  Refreshing and retrying this search")
         refresh_and_verify_ship_to_us(page)
         return process_product(page, product, saved_html=None, **kwargs)
