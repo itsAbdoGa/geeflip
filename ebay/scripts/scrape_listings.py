@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from lib.ebay_scraper import (
     BROWSER_RESTART_EVERY,
+    PRODUCTION_SEARCH_PAUSE_SECONDS,
     EbayShipToNotUsError,
     browser_session,
     describe_ebay_cookie_session,
@@ -27,8 +29,8 @@ from lib.ebay_scraper import (
     format_below_buybox_listing_logs,
     format_block_log,
     format_cheapest_listing_log,
-    is_browser_crash,
     is_production,
+    is_recoverable_browser_error,
     load_ebay_cookies,
     log_page_debug,
     parse_price,
@@ -1723,8 +1725,11 @@ def main(settings: ScrapeSettings | None = None) -> int:
                             )
                             break
                         except Exception as error:
-                            if not is_browser_crash(error) or crash_retries >= 2:
-                                if not is_browser_crash(error):
+                            if (
+                                not is_recoverable_browser_error(error)
+                                or crash_retries >= 2
+                            ):
+                                if not is_recoverable_browser_error(error):
                                     log_page_debug(
                                         reason="scrape failed",
                                         error=error,
@@ -1733,13 +1738,15 @@ def main(settings: ScrapeSettings | None = None) -> int:
                                 raise
                             crash_retries += 1
                             print(
-                                "  Browser crashed; restarting, warming up ebay.com, "
-                                f"and retrying this search ({crash_retries}/2): {error}",
+                                "  Bot-check or browser crash; restarting, warming up "
+                                f"ebay.com, and retrying ({crash_retries}/2): {error}",
                                 flush=True,
                             )
                             session.restart()
                             searches_since_browser_start = 0
                     keep_winners(product_winners)
+                    if is_production():
+                        time.sleep(PRODUCTION_SEARCH_PAUSE_SECONDS)
         if stop_reason:
             print("Scrape stopped from the website; saving winners collected so far")
             log_current_stop(stop_reason)

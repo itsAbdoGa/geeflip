@@ -38,7 +38,8 @@ LINUX_BROWSER_ARGS = [
 BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
 BROWSER_WARMUP_ATTEMPTS = 3
-CHALLENGE_WAIT_TIMEOUT_MS = 35_000
+CHALLENGE_WAIT_TIMEOUT_MS = 8_000
+PRODUCTION_SEARCH_PAUSE_SECONDS = 2.0
 HEAVY_ASSET_RE = re.compile(
     r".*\.(?:png|jpe?g|gif|webp|svg|avif|ico|woff2?|ttf|otf|mp4|webm)(?:\?.*)?$",
     re.I,
@@ -879,6 +880,16 @@ def is_browser_crash(error: BaseException) -> bool:
     )
 
 
+def is_recoverable_browser_error(error: BaseException) -> bool:
+    if is_browser_crash(error):
+        return True
+    text = str(error).casefold()
+    return (
+        isinstance(error, EbayBlockedError)
+        and "bot-check splash" in text
+    ) or "bot-check splash did not redirect" in text
+
+
 def iter_direct_element_children(node):
     child = node.child
     while child:
@@ -1405,7 +1416,7 @@ def wait_out_ebay_challenge(
             raise
         return False
 
-    print("eBay bot-check splash detected; polling until it redirects...", flush=True)
+    print("eBay bot-check splash detected; restarting if it does not clear quickly...", flush=True)
     deadline = time.monotonic() + (timeout_ms / 1000)
     last_url = ""
     while time.monotonic() < deadline:
@@ -1923,7 +1934,8 @@ def scrape_search_page(
             status_code=fetch_result.status_code,
         )
     except Exception as error:
-        log_page_debug(reason="search page failed", error=error, page=page)
+        if not is_recoverable_browser_error(error):
+            log_page_debug(reason="search page failed", error=error, page=page)
         raise
 
 
