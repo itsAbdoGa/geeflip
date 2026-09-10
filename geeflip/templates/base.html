@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}GEEFLIP V2{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">GEEFLIP <em>V2</em></span>
+    </a>
+    <nav class="nav">
+      <a href="/" class="{{ 'active' if active_page == 'feed' }}">Scrape desk</a>
+      <a href="/asins" class="{{ 'active' if active_page == 'asins' }}">ASIN database</a>
+    </nav>
+    <div class="top-meta">
+      <span class="lamp" id="status-lamp" data-state="idle">
+        <i></i><span id="status-text">idle</span>
+      </span>
+    </div>
+  </header>
+  {% block body %}{% endblock %}
+  <script src="{{ url_for('static', filename='js/common.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

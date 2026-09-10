@@ -1,253 +1,251 @@
-"""GEEFLIP website — scrape control room.
+"""GEEFLIP V2 — Flask front end for the eBay arbitrage scraper.
 
-Run from anywhere:
     python geeflip/app.py
-Then open http://127.0.0.1:8787
+    http://127.0.0.1:8787
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import sys
 from pathlib import Path
 
-from contextlib import asynccontextmanager
-
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-
-GEEFLIP_ROOT = Path(__file__).resolve().parent
-PROJECT_ROOT = GEEFLIP_ROOT.parent
+PACKAGE_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = PACKAGE_ROOT.parent
 EBAY_ROOT = PROJECT_ROOT / "ebay"
-for path in (str(GEEFLIP_ROOT), str(EBAY_ROOT), str(PROJECT_ROOT)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+for entry in (str(PACKAGE_ROOT), str(EBAY_ROOT), str(PROJECT_ROOT)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
 
-from cookies import read_cookie, write_cookie, cookie_status
-from db import GeeflipStore
-from lib.ebay_scraper import ensure_playwright_chromium_installed, use_ebay_http
-from scrape_runner import ScrapeRunner, coerce_filters
+from flask import Flask, jsonify, render_template, request
 
-store = GeeflipStore()
+from cookies import cookie_status, read_cookie, write_cookie
+from filters import DEFAULT_FILTERS, build_settings, coerce_filters
+from importer import ensure_ready, import_amazon_images, import_catalog
+from runner import ScrapeRunner
+from store import Store
+
+app = Flask(__name__)
+store = Store()
 runner = ScrapeRunner(store)
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    print("GEEFLIP: loading catalog into SQLite if needed", flush=True)
-    result = store.ensure_imported()
-    if result.get("imported"):
-        print(
-            f"GEEFLIP: imported {result['products']:,} products, "
-            f"{result.get('winners', 0):,} winners",
-            flush=True,
-        )
-    elif result.get("skipped"):
-        print("GEEFLIP: catalog Excel not found; starting with empty SQLite", flush=True)
-    else:
-        print(
-            f"GEEFLIP: catalog already loaded ({result['products']:,} products)",
-            flush=True,
-        )
-    store.load_products()
-    print("GEEFLIP: loading Amazon images from Keepa if needed", flush=True)
-    images = store.ensure_keepa_images()
-    if images.get("imported"):
-        print(
-            f"GEEFLIP: attached Keepa photos to {images.get('updated', 0):,} ASINs "
-            f"({images.get('with_image', 0):,} with images)",
-            flush=True,
-        )
-    elif images.get("skipped"):
-        print("GEEFLIP: Keepa workbook not found; Amazon photos skipped", flush=True)
-    else:
-        print(
-            f"GEEFLIP: Amazon photos already loaded "
-            f"({images.get('with_image', 0):,} products)",
-            flush=True,
-        )
-    if not use_ebay_http():
-        print("GEEFLIP: ensuring Playwright Chromium is installed", flush=True)
-        ensure_playwright_chromium_installed()
-    else:
-        print(
-            "GEEFLIP: production eBay scrape uses requests (no Chromium)",
-            flush=True,
-        )
-    print("GEEFLIP: http://127.0.0.1:8787", flush=True)
-    yield
+def _int_arg(name: str, default: int | None = None) -> int | None:
+    raw = request.args.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
 
 
-app = FastAPI(title="GEEFLIP", lifespan=lifespan)
+def _float_arg(name: str, default: float | None = None) -> float | None:
+    raw = request.args.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# ----------------------------------------------------------------------
+# pages
+# ----------------------------------------------------------------------
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / "index.html")
+def page_feed():
+    return render_template(
+        "index.html",
+        filters=store.load_filters(DEFAULT_FILTERS),
+        stats=store.stats(),
+    )
 
 
 @app.get("/asins")
-def asins_page() -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / "asins.html")
+def page_asins():
+    return render_template("asins.html", stats=store.stats(), brands=store.brands())
 
 
-@app.get("/history")
-def history_page() -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / "history.html")
-
-
-@app.get("/admin")
-def admin_page() -> FileResponse:
-    return FileResponse(GEEFLIP_ROOT / "static" / "admin.html")
+# ----------------------------------------------------------------------
+# scrape control
+# ----------------------------------------------------------------------
 
 
 @app.get("/api/status")
-def status() -> dict:
-    return runner.snapshot()
+def api_status():
+    return jsonify(runner.snapshot())
+
+
+@app.get("/api/logs")
+def api_logs():
+    after = _int_arg("after", 0) or 0
+    return jsonify({"logs": runner.logs_after(after)})
+
+
+@app.post("/api/logs/clear")
+def api_clear_logs():
+    runner.clear_logs()
+    return jsonify({"ok": True})
 
 
 @app.get("/api/filters")
-def get_filters() -> dict:
-    return store.load_filters()
+def api_get_filters():
+    return jsonify(store.load_filters(DEFAULT_FILTERS))
 
 
 @app.put("/api/filters")
-def put_filters(payload: dict = Body(...)) -> dict:
+def api_put_filters():
     try:
-        filters = coerce_filters(payload)
-        from scrape_runner import settings_from_filters
-
-        settings_from_filters(filters, store).validate()
+        filters = coerce_filters(request.get_json(silent=True) or {})
+        build_settings(filters, store).validate()
     except (TypeError, ValueError) as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return store.save_filters(filters)
+        return jsonify({"error": str(error)}), 400
+    return jsonify(store.save_filters(filters))
 
 
 @app.post("/api/preview")
-def preview(payload: dict = Body(...)) -> dict:
+def api_preview():
     try:
-        filters = coerce_filters(payload)
-        return runner.preview(filters)
+        return jsonify(runner.preview(request.get_json(silent=True) or {}))
     except (TypeError, ValueError) as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        return jsonify({"error": str(error)}), 400
 
 
 @app.post("/api/scrape/start")
-def start_scrape(payload: dict | None = Body(None)) -> dict:
-    filters = coerce_filters(payload or store.load_filters())
+def api_start():
+    payload = request.get_json(silent=True)
+    filters = coerce_filters(payload if payload else store.load_filters(DEFAULT_FILTERS))
     try:
-        from scrape_runner import settings_from_filters
-
-        settings_from_filters(filters, store).validate()
+        build_settings(filters, store).validate()
         store.save_filters(filters)
-        return runner.start(filters)
+        return jsonify(runner.start(filters))
     except RuntimeError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        return jsonify({"error": str(error)}), 409
     except (TypeError, ValueError) as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        return jsonify({"error": str(error)}), 400
 
 
 @app.post("/api/scrape/stop")
-def stop_scrape() -> dict:
-    return runner.stop()
+def api_stop():
+    return jsonify(runner.stop())
 
 
-@app.get("/api/scrape/logs")
-async def scrape_logs(after: int = 0) -> StreamingResponse:
-    async def generate():
-        last_id = after
-        while True:
-            lines = runner.logs_after(last_id)
-            for item in lines:
-                last_id = item["id"]
-                yield f"data: {json.dumps(item)}\n\n"
-            yield ": ping\n\n"
-            await asyncio.sleep(0.35)
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+# ----------------------------------------------------------------------
+# winning listings feed
+# ----------------------------------------------------------------------
 
 
 @app.get("/api/winners")
-def winners(
-    run_id: int | None = None,
-    limit: int = 80,
-    offset: int = 0,
-) -> dict:
-    rows = store.list_winners(
-        run_id=run_id,
-        limit=max(1, min(limit, 300)),
-        offset=max(0, offset),
+def api_winners():
+    limit = max(1, min(_int_arg("limit", 40) or 40, 200))
+    return jsonify(
+        store.list_winners(
+            run_id=_int_arg("run_id"),
+            review=request.args.get("review", "all"),
+            search=request.args.get("q", ""),
+            limit=limit,
+            offset=max(0, _int_arg("offset", 0) or 0),
+        )
     )
-    return {
-        "run_id": run_id,
-        "offset": offset,
-        "count": store.winner_count(run_id=run_id),
-        "winners": rows,
-    }
 
 
-@app.post("/api/winners/{winner_id}/seen")
-def mark_winner_seen(winner_id: int, payload: dict = Body(...)) -> dict:
-    seen = bool(payload.get("seen", True))
-    row = store.set_winner_seen(winner_id, seen)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Winner not found")
-    return row
+@app.post("/api/winners/<int:winner_id>/seen")
+def api_winner_seen(winner_id: int):
+    payload = request.get_json(silent=True) or {}
+    winner = store.set_winner_seen(winner_id, bool(payload.get("seen", True)))
+    if winner is None:
+        return jsonify({"error": "Listing not found"}), 404
+    return jsonify(winner)
 
 
-@app.post("/api/winners/{winner_id}/mismatch")
-def mark_winner_mismatched(winner_id: int, payload: dict = Body(...)) -> dict:
-    mismatched = bool(payload.get("mismatched", True))
-    row = store.set_winner_mismatched(winner_id, mismatched)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Winner not found")
-    return row
+@app.post("/api/winners/<int:winner_id>/verdict")
+def api_winner_verdict(winner_id: int):
+    payload = request.get_json(silent=True) or {}
+    verdict = payload.get("verdict")
+    if verdict in ("", "none"):
+        verdict = None
+    try:
+        winner = store.set_winner_verdict(winner_id, verdict)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    if winner is None:
+        return jsonify({"error": "Listing not found"}), 404
+    return jsonify(winner)
+
+
+# ----------------------------------------------------------------------
+# ASIN database
+# ----------------------------------------------------------------------
 
 
 @app.get("/api/asins")
-def asins(q: str = "", offset: int = 0, limit: int = 50) -> dict:
-    return store.list_asins(
-        query=q,
-        offset=max(0, offset),
-        limit=max(1, min(limit, 200)),
+def api_asins():
+    limit = max(1, min(_int_arg("limit", 50) or 50, 200))
+    return jsonify(
+        store.list_asins(
+            search=request.args.get("q", ""),
+            brand=request.args.get("brand", ""),
+            activity=request.args.get("activity", "all"),
+            sort=request.args.get("sort", "row"),
+            min_rank=_int_arg("min_rank"),
+            max_rank=_int_arg("max_rank"),
+            min_buybox=_float_arg("min_buybox"),
+            max_buybox=_float_arg("max_buybox"),
+            limit=limit,
+            offset=max(0, _int_arg("offset", 0) or 0),
+        )
     )
 
 
-@app.get("/api/admin/cookie")
-def get_cookie() -> dict:
-    status = cookie_status()
-    status["cookie"] = read_cookie()
-    return status
+@app.get("/api/stats")
+def api_stats():
+    return jsonify(store.stats())
 
 
-@app.post("/api/admin/cookie")
-def update_cookie(payload: dict = Body(...)) -> dict:
-    cookie = str(payload.get("cookie") or "").strip()
+# ----------------------------------------------------------------------
+# maintenance
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/cookie")
+def api_get_cookie():
+    return jsonify({**cookie_status(), "cookie": read_cookie()})
+
+
+@app.post("/api/cookie")
+def api_set_cookie():
+    cookie = str((request.get_json(silent=True) or {}).get("cookie") or "").strip()
     if cookie and "=" not in cookie:
-        raise HTTPException(
-            status_code=400,
-            detail="That does not look like a cookie header (expected name=value pairs).",
-        )
+        return jsonify({"error": "That does not look like a cookie header"}), 400
     write_cookie(cookie)
-    status = cookie_status()
-    status["cookie"] = read_cookie()
-    return status
+    return jsonify({**cookie_status(), "cookie": read_cookie()})
 
 
-app.mount("/static", StaticFiles(directory=GEEFLIP_ROOT / "static"), name="static")
+@app.post("/api/catalog/reimport")
+def api_reimport():
+    if runner.running:
+        return jsonify({"error": "Cannot reimport while a scrape is running"}), 409
+    try:
+        products = import_catalog(store)
+        images = import_amazon_images(store)
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"products": products, "images": images, **store.stats()})
+
+
+def main() -> None:
+    summary = ensure_ready(store)
+    if summary.get("imported"):
+        print(f"GEEFLIP: imported {summary['products']:,} products from Excel")
+    print(
+        f"GEEFLIP V2: {summary['products']:,} products, "
+        f"{summary['winners']:,} winning listings"
+    )
+    print("GEEFLIP V2: http://127.0.0.1:8787")
+    app.run(host="127.0.0.1", port=8787, threaded=True, debug=False)
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="127.0.0.1", port=8777, log_level="info")
+    main()

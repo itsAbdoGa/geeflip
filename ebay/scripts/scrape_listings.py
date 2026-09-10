@@ -1,23 +1,16 @@
-import csv
-import json
-import os
 import re
 import sys
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from openpyxl import Workbook, load_workbook
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from lib.ebay_scraper import (
     BROWSER_RESTART_EVERY,
-    PRODUCTION_SEARCH_PAUSE_SECONDS,
     EbayShipToNotUsError,
     browser_session,
     describe_ebay_cookie_session,
@@ -30,59 +23,19 @@ from lib.ebay_scraper import (
     format_block_log,
     format_cheapest_listing_log,
     is_playwright_page,
-    is_production,
-    is_recoverable_browser_error,
     load_ebay_cookies,
     log_page_debug,
     parse_price,
     refresh_and_verify_ship_to_us,
     scrape_image_search_page,
     scrape_search_page,
-    scrape_search_page_from_html,
-    use_ebay_http,
 )
-from lib.ebay_http import EbayHttpSession
-from lib.paths import (
-    COMBINED_XLSX,
-    EBAY_COOKIES_FILE,
-    IDENTIFIER_NO_MATCH_HISTORY_JSON,
-    WINNING_LISTINGS_JSON,
-    WINNING_LISTINGS_HISTORY_JSON,
-    WINNING_LISTINGS_XLSX,
-    create_workbook_backup,
-    ensure_data_dirs,
-    log_workbook_stop,
-    prune_directory_workbook_backups,
-)
-
-TEXT_COLUMNS = {"EAN", "ASIN"}
-WINNER_HEADERS = [
-    "title",
-    "ASIN",
-    "EAN",
-    "Brand",
-    "BUYBOX",
-    "AMAZON URL",
-    "EBAY full cost",
-    "SELLER",
-    "SELLER REVIEWS",
-    "LISTING DATE",
-    "ROI",
-    "EBAY listing URL",
-    "ebay listing query",
-    "search_source",
-]
+from lib.paths import EBAY_COOKIES_FILE
 
 
 @dataclass
 class ScrapeSettings:
-    """Tweak these in ebay/main.py, then run that file."""
-
-    input_csv: Path = COMBINED_XLSX
-    output_xlsx: Path = WINNING_LISTINGS_XLSX
-    live_json: Path = WINNING_LISTINGS_JSON
-    winner_history: Path = WINNING_LISTINGS_HISTORY_JSON
-    identifier_no_match_history: Path = IDENTIFIER_NO_MATCH_HISTORY_JSON
+    """One scrape's worth of options, built by the website from its filter panel."""
 
     start_row: int | None = None
     end_row: int | None = None
@@ -108,13 +61,10 @@ class ScrapeSettings:
     winner_history_retention_days: int = 3
     identifier_no_match_retention_days: int = 3
 
-    html_path: Path | None = None
     cookies_file: Path | None = EBAY_COOKIES_FILE
     cookie_header: str | None = None
 
     headless: bool = True
-    write_xlsx: bool = True
-    write_json: bool = True
     should_stop: Callable[[], bool] | None = None
     store: object | None = None
 
@@ -165,42 +115,6 @@ class ScrapeSettings:
             "max_listing_age_days": self.max_listing_age_days,
             "min_seller_reviews": self.min_seller_reviews,
         }
-
-
-def load_products(path: Path) -> list[dict[str, str]]:
-    if path.suffix.lower() == ".xlsx":
-        workbook = load_workbook(path, read_only=True, data_only=True)
-        try:
-            sheet = workbook.active
-            values = sheet.iter_rows(values_only=True)
-            headers = [str(value or "") for value in next(values, ())]
-            rows = [dict(zip(headers, row)) for row in values]
-        finally:
-            workbook.close()
-    else:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
-
-    products = []
-    # Row 1 contains headers, so these numbers match Excel's visible row numbers.
-    for source_row, row in enumerate(rows, start=2):
-        products.append(
-            {
-                "csv_row": source_row,
-                "title": str(row.get("TITLE") or ""),
-                "asin": str(row.get("ASIN") or ""),
-                "ean": str(row.get("EAN") or ""),
-                "upc": str(row.get("UPC") or ""),
-                "cleaned_title": str(row.get("CLEANED TITLE") or "").strip(),
-                "sales_rank": str(row.get("SALES RANK") or ""),
-                "drops_count": str(row.get("DROPS (90 DAYS)") or ""),
-                "brand": str(row.get("Brand") or ""),
-                "buybox_price": str(row.get("Buybox (30 days)") or ""),
-                "amazon_url": str(row.get("URL: Amazon") or ""),
-                "search_url": str(row.get("ebay listing") or "").strip(),
-            }
-        )
-    return products
 
 
 def parse_sales_rank(value: object) -> int | None:
@@ -254,23 +168,6 @@ def ebay_search_url_for_identifier(search_url: str, identifier: str) -> str:
 def identifier_query_key(identifier_type: str, identifier: object) -> str:
     value = str(identifier or "").strip().casefold()
     return f"{identifier_type.upper()}:{value}" if value else ""
-
-
-def scrape_stop_extra(product: dict[str, str] | None) -> dict:
-    if not product:
-        return {}
-    return {
-        "query_type": str(product.get("search_identifier_type") or ""),
-        "query": str(
-            product.get("search_identifier")
-            or product.get("ean")
-            or product.get("asin")
-            or ""
-        ),
-        "asin": str(product.get("asin") or ""),
-        "selection_position": product.get("selection_position"),
-        "selection_total": product.get("selection_total"),
-    }
 
 
 def expand_identifier_searches(
@@ -678,58 +575,6 @@ def verify_winners_amazon_sales_rank(
     return []
 
 
-def _alternate_output_path(output_path: Path, attempt: int) -> Path:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if attempt == 0:
-        return output_path.with_name(f"{output_path.stem}_{stamp}{output_path.suffix}")
-    return output_path.with_name(
-        f"{output_path.stem}_{stamp}_{attempt}{output_path.suffix}"
-    )
-
-
-def write_winners_xlsx(winners: list[dict], output_path: Path) -> Path:
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Winning Listings"
-    sheet.append(WINNER_HEADERS)
-
-    col_indexes = {header: index + 1 for index, header in enumerate(WINNER_HEADERS)}
-
-    for winner in winners:
-        sheet.append([winner.get(header, "") for header in WINNER_HEADERS])
-
-    for row_idx in range(2, len(winners) + 2):
-        for header in TEXT_COLUMNS:
-            cell = sheet.cell(row=row_idx, column=col_indexes[header])
-            cell.value = "" if cell.value is None else str(cell.value)
-            cell.number_format = "@"
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    candidates = [output_path, *(_alternate_output_path(output_path, i) for i in range(5))]
-    last_error: PermissionError | None = None
-    for candidate in candidates:
-        try:
-            workbook.save(candidate)
-            return candidate
-        except PermissionError as error:
-            last_error = error
-
-    raise PermissionError(
-        f"Could not save winning listings; file may be open in another program: {output_path}"
-    ) from last_error
-
-
-def write_winners_json(winners: list[dict], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
-    temporary_path.write_text(
-        json.dumps(winners, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    temporary_path.replace(output_path)
-
-
 def winner_listing_key(winner: dict) -> str:
     url = str(winner.get("EBAY listing URL") or "").strip()
     if not url:
@@ -756,24 +601,10 @@ def winner_listing_key(winner: dict) -> str:
     )
 
 
-def load_winner_records(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
-        raise ValueError(f"Winner history must contain a JSON list: {path}")
-    return data
-
-
 def persist_records(
     records: list[dict],
-    path: Path | None,
     persist: Callable[[list[dict]], None] | None,
-    *,
-    write_json: bool = True,
 ) -> None:
-    if write_json and path is not None:
-        write_winners_json(records, path)
     if persist is not None:
         persist(records)
 
@@ -821,29 +652,13 @@ def normalize_identifier_no_match_history(
     return retained, active_keys, pending_deletions
 
 
-def initialize_identifier_no_match_history(
-    history_path: Path,
-    retention_days: int,
-) -> tuple[list[dict], set[str], set[str]]:
-    history = load_winner_records(history_path)
-    retained, active_keys, pending_deletions = normalize_identifier_no_match_history(
-        history,
-        retention_days,
-    )
-    if retained != history:
-        write_winners_json(retained, history_path)
-    return retained, active_keys, pending_deletions
-
-
 def record_identifier_no_match(
     product: dict[str, str],
     *,
     history: list[dict],
     history_keys: set[str],
-    history_path: Path | None,
     retention_days: int,
     persist: Callable[[list[dict]], None] | None = None,
-    write_json: bool = True,
 ) -> bool:
     query_type = str(product.get("search_identifier_type") or "").upper()
     identifier = str(product.get("search_identifier") or "").strip()
@@ -877,7 +692,7 @@ def record_identifier_no_match(
     consecutive = int(existing.get("consecutive_no_matches") or 0) + 1
     existing["consecutive_no_matches"] = consecutive
     existing["no_exact_match_at"] = datetime.now().isoformat(timespec="seconds")
-    persist_records(history, history_path, persist, write_json=write_json)
+    persist_records(history, persist)
     if consecutive >= 2:
         print(
             f"  {query_type} {identifier} returned no exact matches twice; "
@@ -897,9 +712,7 @@ def clear_identifier_no_match_streak(
     *,
     history: list[dict],
     history_keys: set[str],
-    history_path: Path | None,
     persist: Callable[[list[dict]], None] | None = None,
-    write_json: bool = True,
 ) -> None:
     query_type = str(product.get("search_identifier_type") or "").upper()
     identifier = str(product.get("search_identifier") or "").strip()
@@ -920,82 +733,22 @@ def clear_identifier_no_match_streak(
         return
     history[:] = retained
     history_keys.discard(key)
-    persist_records(history, history_path, persist, write_json=write_json)
-
-
-def delete_identifiers_from_workbook(
-    path: Path,
-    deletion_keys: set[str],
-) -> int:
-    if not deletion_keys or path.suffix.casefold() != ".xlsx":
-        return 0
-
-    workbook = load_workbook(path)
-    worksheet = workbook["main"] if "main" in workbook.sheetnames else workbook.active
-    columns = {
-        str(cell.value or "").strip().upper(): cell.column
-        for cell in worksheet[1]
-    }
-    missing = {"EAN", "UPC"}.difference(columns)
-    if missing:
-        workbook.close()
-        raise ValueError(
-            f"Cannot delete identifiers; missing columns: {', '.join(sorted(missing))}"
-        )
-
-    changed = 0
-    for row_number in range(2, worksheet.max_row + 1):
-        for query_type in ("EAN", "UPC"):
-            cell = worksheet.cell(
-                row=row_number,
-                column=columns[query_type],
-            )
-            codes = [
-                code.strip()
-                for code in str(cell.value or "").split(",")
-                if code.strip()
-            ]
-            remaining = [
-                code
-                for code in codes
-                if identifier_query_key(query_type, code) not in deletion_keys
-            ]
-            if remaining == codes:
-                continue
-            cell.value = ", ".join(remaining)
-            cell.number_format = "@"
-            changed += 1
-
-    backup_path = create_workbook_backup(path)
-    temporary_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
-    try:
-        workbook.save(temporary_path)
-        os.replace(temporary_path, path)
-    finally:
-        workbook.close()
-        temporary_path.unlink(missing_ok=True)
-    return changed
+    persist_records(history, persist)
 
 
 def apply_identifier_deletions(
-    input_path: Path | None,
     deletion_keys: set[str],
     *,
     history: list[dict],
     history_keys: set[str],
-    history_path: Path | None,
     persist: Callable[[list[dict]], None] | None = None,
     identifier_deleter: Callable[[set[str]], int] | None = None,
-    write_json: bool = True,
 ) -> int:
     if not deletion_keys:
         return 0
-    if identifier_deleter is not None:
-        changed = identifier_deleter(deletion_keys)
-    else:
-        if input_path is None:
-            raise ValueError("Cannot delete identifiers without an input workbook")
-        changed = delete_identifiers_from_workbook(input_path, deletion_keys)
+    if identifier_deleter is None:
+        raise ValueError("Cannot delete identifiers without a store")
+    changed = identifier_deleter(deletion_keys)
     history[:] = [
         record
         for record in history
@@ -1006,7 +759,7 @@ def apply_identifier_deletions(
         not in deletion_keys
     ]
     history_keys.difference_update(deletion_keys)
-    persist_records(history, history_path, persist, write_json=write_json)
+    persist_records(history, persist)
     deletion_keys.clear()
     return changed
 
@@ -1014,10 +767,8 @@ def apply_identifier_deletions(
 def normalize_winner_history(
     history: list[dict],
     *,
-    live_winners: list[dict] | None = None,
-    history_exists: bool = True,
     retention_days: int | None,
-) -> tuple[list[dict], set[str], int, int]:
+) -> tuple[list[dict], set[str], int]:
     history_keys: set[str] = set()
     deduplicated_history: list[dict] = []
     pruned = 0
@@ -1051,45 +802,7 @@ def normalize_winner_history(
             stored["first_won_at"] = now.isoformat(timespec="seconds")
         deduplicated_history.append(stored)
 
-    seeded = 0
-    if not history_exists and live_winners:
-        for winner in live_winners:
-            key = winner_listing_key(winner)
-            if not key or key in history_keys:
-                continue
-            history_keys.add(key)
-            stored = winner.copy()
-            stored["history_key"] = key
-            stored["first_won_at"] = now.isoformat(timespec="seconds")
-            deduplicated_history.append(stored)
-            seeded += 1
-
-    return deduplicated_history, history_keys, seeded, pruned
-
-
-def initialize_winner_history(
-    history_path: Path,
-    live_json_path: Path,
-    retention_days: int | None,
-) -> tuple[list[dict], set[str], int, int]:
-    history_exists = history_path.exists()
-    history = load_winner_records(history_path)
-    live_winners = (
-        load_winner_records(live_json_path)
-        if not history_exists and live_json_path.exists()
-        else []
-    )
-    deduplicated_history, history_keys, seeded, pruned = normalize_winner_history(
-        history,
-        live_winners=live_winners,
-        history_exists=history_exists,
-        retention_days=retention_days,
-    )
-
-    if seeded or deduplicated_history != history:
-        write_winners_json(deduplicated_history, history_path)
-
-    return deduplicated_history, history_keys, seeded, pruned
+    return deduplicated_history, history_keys, pruned
 
 
 def persist_new_winners(
@@ -1100,13 +813,9 @@ def persist_new_winners(
     history: list[dict],
     history_keys: set[str],
     skip_previously_won: bool,
-    live_json_path: Path | None,
-    history_path: Path | None,
-    write_json: bool = True,
     store: object | None = None,
 ) -> tuple[int, int]:
     accepted: list[dict] = []
-    history_changed = False
     skipped = 0
 
     for winner in candidates:
@@ -1127,14 +836,9 @@ def persist_new_winners(
             stored["history_key"] = key
             stored["first_won_at"] = datetime.now().isoformat(timespec="seconds")
             history.append(stored)
-            history_changed = True
 
-    if history_changed and write_json and history_path is not None:
-        write_winners_json(history, history_path)
     if accepted:
         winners.extend(accepted)
-        if write_json and live_json_path is not None:
-            write_winners_json(winners, live_json_path)
         if store is not None:
             append_winners = getattr(store, "append_winners", None)
             if append_winners is not None:
@@ -1156,31 +860,15 @@ def query_label(product: dict[str, str]) -> tuple[str, str]:
     return query_type, str(identifier)
 
 
-def scrape_product_result(
-    page,
-    product: dict[str, str],
-    *,
-    saved_html: str | None,
-) -> dict:
-    common_kwargs = {
-        "title": product["title"],
-        "asin": product["asin"],
-        "ean": product["ean"],
-        "buybox_price": product["buybox_price"],
-    }
-
-    if saved_html is not None:
-        result = scrape_search_page_from_html(
-            product["search_url"],
-            saved_html,
-            **common_kwargs,
-        )
-    else:
-        result = scrape_search_page(
-            page,
-            product["search_url"],
-            **common_kwargs,
-        )
+def scrape_product_result(page, product: dict[str, str]) -> dict:
+    result = scrape_search_page(
+        page,
+        product["search_url"],
+        title=product["title"],
+        asin=product["asin"],
+        ean=product["ean"],
+        buybox_price=product["buybox_price"],
+    )
 
     result["amazon_url"] = product["amazon_url"]
     result["brand"] = product["brand"]
@@ -1302,7 +990,6 @@ def process_product(
     *,
     index: int,
     total: int,
-    saved_html: str | None,
     settings: ScrapeSettings,
     no_exact_match_callback: Callable[[dict[str, str]], None] | None = None,
     exact_match_callback: Callable[[dict[str, str]], None] | None = None,
@@ -1311,7 +998,7 @@ def process_product(
     image_search_cache: dict[str, dict] | None = None,
 ) -> list[dict]:
     identifier_type, identifier = query_label(product)
-    result = scrape_product_result(page, product, saved_html=saved_html)
+    result = scrape_product_result(page, product)
     query_type = str(product.get("search_identifier_type") or "").upper()
     if query_type in {"EAN", "UPC"}:
         if result.get("error") or result.get("block_reason"):
@@ -1328,7 +1015,7 @@ def process_product(
     winner_kw = settings.winner_kwargs()
     rank_cache = amazon_rank_cache if amazon_rank_cache is not None else {}
     fill_missing_seller_reviews(
-        None if saved_html is not None else page,
+        page,
         us_listings,
         buybox_price=result.get("buybox_price_value"),
         cache=seller_review_cache,
@@ -1340,7 +1027,7 @@ def process_product(
         **winner_kw,
     )
     product_winners = verify_winners_amazon_sales_rank(
-        None if saved_html is not None else page,
+        page,
         product_winners,
         amazon_url=str(product.get("amazon_url") or result.get("amazon_url") or ""),
         min_sales_rank=settings.min_sales_rank,
@@ -1360,7 +1047,6 @@ def process_product(
 
     if (
         settings.image_search
-        and saved_html is None
         and is_playwright_page(page)
         and query_type in {"EAN", "UPC"}
         and result.get("listings")
@@ -1384,7 +1070,6 @@ def process_product(
             raise
     elif (
         settings.image_search
-        and saved_html is None
         and not is_playwright_page(page)
         and query_type in {"EAN", "UPC"}
         and result.get("listings")
@@ -1400,7 +1085,7 @@ def process_live_product_with_ship_to_retry(
     **kwargs,
 ) -> list[dict]:
     try:
-        return process_product(page, product, saved_html=None, **kwargs)
+        return process_product(page, product, **kwargs)
     except EbayShipToNotUsError as error:
         identifier_type, identifier = query_label(product)
         print(f"  Ship to is not US for {identifier_type} {identifier}: {error}")
@@ -1411,7 +1096,7 @@ def process_live_product_with_ship_to_retry(
         )
         print("  Refreshing and retrying this search")
         refresh_and_verify_ship_to_us(page)
-        return process_product(page, product, saved_html=None, **kwargs)
+        return process_product(page, product, **kwargs)
 
 
 def _store_method(store: object | None, name: str):
@@ -1430,63 +1115,41 @@ def main(settings: ScrapeSettings | None = None) -> int:
         return 1
 
     store = settings.store
-    input_file = settings.input_csv
-    output_file = settings.output_xlsx
-    json_output_file = settings.live_json
-    history_file = settings.winner_history
-    identifier_no_match_file = settings.identifier_no_match_history
+    if store is None:
+        print("Error: a store is required; run the scrape from the GEEFLIP website")
+        return 1
+
     persist_no_match = _store_method(store, "save_identifier_no_match")
     identifier_deleter = _store_method(store, "delete_identifiers")
     products_loader = _store_method(store, "load_products")
 
-    ensure_data_dirs()
-    if products_loader is None:
-        if not input_file.exists():
-            print(f"Error: input file not found: {input_file}")
-            return 1
-        deleted_backups = prune_directory_workbook_backups(input_file.parent)
-        if deleted_backups:
-            print(f"Deleted {len(deleted_backups)} old workbook backup(s)")
-
     try:
-        if persist_no_match is not None:
-            raw_no_match = _store_method(store, "load_identifier_no_match")()
-            (
-                identifier_no_match_history,
-                identifier_no_match_keys,
-                pending_identifier_deletions,
-            ) = normalize_identifier_no_match_history(
-                raw_no_match or [],
-                settings.identifier_no_match_retention_days,
-            )
-            if identifier_no_match_history != (raw_no_match or []):
-                persist_no_match(identifier_no_match_history)
-        else:
-            (
-                identifier_no_match_history,
-                identifier_no_match_keys,
-                pending_identifier_deletions,
-            ) = initialize_identifier_no_match_history(
-                identifier_no_match_file,
-                settings.identifier_no_match_retention_days,
-            )
+        raw_no_match = _store_method(store, "load_identifier_no_match")() or []
+        (
+            identifier_no_match_history,
+            identifier_no_match_keys,
+            pending_identifier_deletions,
+        ) = normalize_identifier_no_match_history(
+            raw_no_match,
+            settings.identifier_no_match_retention_days,
+        )
+        if identifier_no_match_history != raw_no_match:
+            persist_records(identifier_no_match_history, persist_no_match)
     except Exception as error:
         print(f"Error loading identifier no-match history: {error}")
         return 1
+
     if pending_identifier_deletions:
         try:
             deleted_cells = apply_identifier_deletions(
-                input_file,
                 pending_identifier_deletions,
                 history=identifier_no_match_history,
                 history_keys=identifier_no_match_keys,
-                history_path=identifier_no_match_file,
                 persist=persist_no_match,
                 identifier_deleter=identifier_deleter,
-                write_json=settings.write_json,
             )
             print(
-                f"Deleted {deleted_cells} EAN/UPC cells after repeated "
+                f"Deleted {deleted_cells} EAN/UPC codes after repeated "
                 "no-match results"
             )
         except Exception as error:
@@ -1499,11 +1162,8 @@ def main(settings: ScrapeSettings | None = None) -> int:
         )
 
     try:
-        source_products = (
-            products_loader() if products_loader is not None else load_products(input_file)
-        )
         products, selection_details = select_products(
-            source_products,
+            products_loader(),
             settings,
             skipped_identifier_keys=identifier_no_match_keys,
         )
@@ -1512,7 +1172,7 @@ def main(settings: ScrapeSettings | None = None) -> int:
         return 1
 
     if not products:
-        print(f"Error: no rows selected to scrape from {input_file}")
+        print("Error: no catalog rows matched these filters")
         return 1
 
     print(selection_details)
@@ -1536,23 +1196,18 @@ def main(settings: ScrapeSettings | None = None) -> int:
 
     def log_current_stop(reason: str) -> None:
         product = current_product or (products[0] if products else None)
-        log_workbook_stop(
-            workbook_path=input_file,
-            excel_row=None if product is None else product.get("csv_row"),
-            reason=reason,
-            script="scrape",
-            extra=scrape_stop_extra(product),
-        )
+        row = None if product is None else product.get("csv_row")
+        print(f"Stopped at catalog row {row or 'unknown'} — {reason}")
+        if row:
+            print(f"Resume with start row {row}")
 
     def cache_identifier_no_match(product: dict[str, str]) -> None:
         should_delete = record_identifier_no_match(
             product,
             history=identifier_no_match_history,
             history_keys=identifier_no_match_keys,
-            history_path=identifier_no_match_file,
             retention_days=settings.identifier_no_match_retention_days,
             persist=persist_no_match,
-            write_json=settings.write_json,
         )
         if should_delete:
             pending_identifier_deletions.add(
@@ -1567,9 +1222,7 @@ def main(settings: ScrapeSettings | None = None) -> int:
             product,
             history=identifier_no_match_history,
             history_keys=identifier_no_match_keys,
-            history_path=identifier_no_match_file,
             persist=persist_no_match,
-            write_json=settings.write_json,
         )
 
     def keep_winners(product_winners: list[dict]) -> None:
@@ -1583,251 +1236,116 @@ def main(settings: ScrapeSettings | None = None) -> int:
             history=winner_history,
             history_keys=winner_history_keys,
             skip_previously_won=settings.skip_previously_won,
-            live_json_path=json_output_file,
-            history_path=history_file,
-            write_json=settings.write_json,
             store=store,
         )
         skipped_previous_winners += skipped
 
-    def process_kwargs(index: int, total_count: int, *, live: bool = False) -> dict:
-        kwargs = {
+    def process_kwargs(index: int, total_count: int) -> dict:
+        return {
             "index": index,
             "total": total_count,
             "settings": settings,
             "seller_review_cache": seller_review_cache,
             "amazon_rank_cache": amazon_rank_cache,
             "image_search_cache": image_search_cache,
+            "no_exact_match_callback": cache_identifier_no_match,
+            "exact_match_callback": clear_identifier_streak,
         }
-        if live:
-            kwargs["no_exact_match_callback"] = cache_identifier_no_match
-            kwargs["exact_match_callback"] = clear_identifier_streak
-        return kwargs
 
     try:
-        load_history = _store_method(store, "load_winner_history")
+        stored_history = _store_method(store, "load_winner_history")() or []
+        winner_history, winner_history_keys, pruned_history = normalize_winner_history(
+            stored_history,
+            retention_days=settings.winner_history_retention_days,
+        )
         save_history = _store_method(store, "save_winner_history")
-        if load_history is not None:
-            stored_history = load_history() or []
-            winner_history, winner_history_keys, seeded_history, pruned_history = (
-                normalize_winner_history(
-                    stored_history,
-                    live_winners=[],
-                    history_exists=True,
-                    retention_days=settings.winner_history_retention_days,
-                )
-            )
-            if pruned_history or winner_history != stored_history:
-                if save_history is not None:
-                    save_history(winner_history)
-        else:
-            winner_history, winner_history_keys, seeded_history, pruned_history = (
-                initialize_winner_history(
-                    history_file,
-                    json_output_file,
-                    settings.winner_history_retention_days,
-                )
-            )
+        if pruned_history and save_history is not None:
+            save_history(winner_history)
     except Exception as error:
         print(f"Error loading winner history: {error}")
         return 1
 
-    if seeded_history:
-        print(
-            f"Seeded winner history with {seeded_history} listings "
-            "from the previous live JSON"
-        )
     if pruned_history:
         print(
-            f"Deleted {pruned_history} winner-history entries older than "
-            f"{settings.winner_history_retention_days} days"
+            f"{pruned_history} listings are older than "
+            f"{settings.winner_history_retention_days} days and can win again"
         )
     print(
-        f"Winner history: {len(winner_history_keys)} listings "
-        f"({'skipping matches' if settings.skip_previously_won else 'tracking only'})"
+        f"Winner history: {len(winner_history_keys)} listings in the dedup window "
+        f"({'skipping repeats' if settings.skip_previously_won else 'tracking only'})"
     )
 
     try:
-        if settings.write_json:
-            write_winners_json(winners, json_output_file)
         save_live = _store_method(store, "save_live_winners")
         if save_live is not None:
             save_live(winners)
-        saved_html = (
-            settings.html_path.read_text(encoding="utf-8")
-            if settings.html_path
-            else None
+        cookies = load_ebay_cookies(
+            cookie_header=settings.cookie_header,
+            cookies_file=settings.cookies_file,
+            default_cookies_file=EBAY_COOKIES_FILE,
         )
-        if saved_html is not None:
-            print("Offline test mode: parsing saved HTML (Playwright not used)")
+        mode_label = "headless" if settings.headless else "headed"
+        print(f"Scraping {total} eBay search URLs with Playwright ({mode_label})")
+        print(f"eBay session: {describe_ebay_cookie_session(cookies)}")
+        if BROWSER_RESTART_EVERY:
+            print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
+        with browser_session(cookies=cookies, headless=settings.headless) as session:
+            skipped_previous_ean_for_ship_to = False
+            searches_since_browser_start = 0
             for index, product in enumerate(products, start=1):
                 if requested_stop():
                     stop_reason = "stopped from website"
                     break
                 current_product = product
+                if (
+                    BROWSER_RESTART_EVERY
+                    and searches_since_browser_start >= BROWSER_RESTART_EVERY
+                ):
+                    print(
+                        f"Restarting browser after {index - 1} searches "
+                        "to free memory"
+                    )
+                    session.restart()
+                    searches_since_browser_start = 0
+                searches_since_browser_start += 1
                 display_index = int(product.get("selection_position", index))
                 display_total = int(product.get("selection_total", total))
-                keep_winners(
-                    process_product(
-                        None,
+                query_type = str(product.get("search_identifier_type") or "").upper()
+                query_key = identifier_query_key(
+                    query_type,
+                    product.get("search_identifier"),
+                )
+                if query_type in {"EAN", "UPC"} and query_key in identifier_no_match_keys:
+                    print(
+                        f"[{display_index}/{display_total}] Skipping "
+                        f"{query_type} {product.get('search_identifier')}: "
+                        "recently had no exact matches"
+                    )
+                    continue
+                try:
+                    product_winners = process_live_product_with_ship_to_retry(
+                        session.page,
                         product,
-                        saved_html=saved_html,
                         **process_kwargs(display_index, display_total),
                     )
-                )
-        else:
-            if use_ebay_http():
-                cookies = load_ebay_cookies(
-                    cookie_header=settings.cookie_header,
-                    cookies_file=settings.cookies_file,
-                    default_cookies_file=EBAY_COOKIES_FILE,
-                )
-                print(
-                    "Scraping eBay search URLs with requests "
-                    "(homepage warmup + proxy)"
-                )
-                print(f"eBay session: {describe_ebay_cookie_session(cookies)}")
-                with EbayHttpSession(cookies=cookies) as http:
-                    for index, product in enumerate(products, start=1):
-                        if requested_stop():
-                            stop_reason = "stopped from website"
-                            break
-                        current_product = product
-                        display_index = int(product.get("selection_position", index))
-                        display_total = int(product.get("selection_total", total))
-                        query_type = str(
-                            product.get("search_identifier_type") or ""
-                        ).upper()
-                        query_key = identifier_query_key(
-                            query_type,
-                            product.get("search_identifier"),
-                        )
-                        if (
-                            query_type in {"EAN", "UPC"}
-                            and query_key in identifier_no_match_keys
-                        ):
-                            print(
-                                f"[{display_index}/{display_total}] Skipping "
-                                f"{query_type} {product.get('search_identifier')}: "
-                                "recently had no exact matches"
-                            )
-                            continue
-                        crash_retries = 0
-                        while True:
-                            try:
-                                product_winners = process_live_product_with_ship_to_retry(
-                                    http,
-                                    product,
-                                    **process_kwargs(
-                                        display_index, display_total, live=True
-                                    ),
-                                )
-                                break
-                            except Exception as error:
-                                if (
-                                    not is_recoverable_browser_error(error)
-                                    or crash_retries >= 2
-                                ):
-                                    if not is_recoverable_browser_error(error):
-                                        log_page_debug(
-                                            reason="scrape failed",
-                                            error=error,
-                                            page=http,
-                                        )
-                                    raise
-                                crash_retries += 1
-                                print(
-                                    "  Challenge or timeout; resetting HTTP session "
-                                    f"and retrying ({crash_retries}/2): {error}",
-                                    flush=True,
-                                )
-                                http.reset()
-                        keep_winners(product_winners)
-                        time.sleep(PRODUCTION_SEARCH_PAUSE_SECONDS)
-            else:
-                cookies = load_ebay_cookies(
-                    cookie_header=settings.cookie_header,
-                    cookies_file=settings.cookies_file,
-                    default_cookies_file=EBAY_COOKIES_FILE,
-                )
-                mode_label = "headless" if settings.headless else "headed"
-                print(f"Scraping {total} eBay search URLs with Playwright ({mode_label})")
-                print(
-                    "Low-end mode: compact Chromium, images/fonts blocked, "
-                    f"browser restart every {BROWSER_RESTART_EVERY} searches"
-                )
-                print(f"eBay session: {describe_ebay_cookie_session(cookies)}")
-                if BROWSER_RESTART_EVERY:
-                    print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
-                with browser_session(cookies=cookies, headless=settings.headless) as session:
-                    searches_since_browser_start = 0
-                    for index, product in enumerate(products, start=1):
-                        if requested_stop():
-                            stop_reason = "stopped from website"
-                            break
-                        current_product = product
-                        if (
-                            BROWSER_RESTART_EVERY
-                            and searches_since_browser_start >= BROWSER_RESTART_EVERY
-                        ):
-                            print(
-                                f"Restarting browser after {index - 1} searches "
-                                "to free memory"
-                            )
-                            session.restart()
-                            searches_since_browser_start = 0
-                        searches_since_browser_start += 1
-                        display_index = int(product.get("selection_position", index))
-                        display_total = int(product.get("selection_total", total))
-                        query_type = str(
-                            product.get("search_identifier_type") or ""
-                        ).upper()
-                        query_key = identifier_query_key(
-                            query_type,
-                            product.get("search_identifier"),
-                        )
-                        if (
-                            query_type in {"EAN", "UPC"}
-                            and query_key in identifier_no_match_keys
-                        ):
-                            print(
-                                f"[{display_index}/{display_total}] Skipping "
-                                f"{query_type} {product.get('search_identifier')}: "
-                                "recently had no exact matches"
-                            )
-                            continue
-                        crash_retries = 0
-                        while True:
-                            try:
-                                product_winners = process_live_product_with_ship_to_retry(
-                                    session.page,
-                                    product,
-                                    **process_kwargs(display_index, display_total, live=True),
-                                )
-                                break
-                            except Exception as error:
-                                if (
-                                    not is_recoverable_browser_error(error)
-                                    or crash_retries >= 2
-                                ):
-                                    if not is_recoverable_browser_error(error):
-                                        log_page_debug(
-                                            reason="scrape failed",
-                                            error=error,
-                                            page=session.page,
-                                        )
-                                    raise
-                                crash_retries += 1
-                                print(
-                                    "  Bot-check or browser crash; restarting, warming up "
-                                    f"ebay.com, and retrying ({crash_retries}/2): {error}",
-                                    flush=True,
-                                )
-                                session.restart()
-                                searches_since_browser_start = 0
-                        keep_winners(product_winners)
-                        if is_production():
-                            time.sleep(PRODUCTION_SEARCH_PAUSE_SECONDS)
+                except EbayShipToNotUsError as error:
+                    ean = product.get("ean") or product.get("asin") or "(unknown)"
+                    if skipped_previous_ean_for_ship_to:
+                        raise EbayShipToNotUsError(
+                            "consecutive_not_us",
+                            detail=(
+                                f"EAN {ean} was still not US after refresh; "
+                                "the previous EAN was also skipped"
+                            ),
+                        ) from error
+                    print(
+                        f"  Skipping EAN {ean}: Ship to is still not US after refresh"
+                    )
+                    skipped_previous_ean_for_ship_to = True
+                    continue
+
+                skipped_previous_ean_for_ship_to = False
+                keep_winners(product_winners)
         if stop_reason:
             print("Scrape stopped from the website; saving winners collected so far")
             log_current_stop(stop_reason)
@@ -1851,40 +1369,21 @@ def main(settings: ScrapeSettings | None = None) -> int:
     if pending_identifier_deletions and not halted_by_error:
         try:
             deleted_cells = apply_identifier_deletions(
-                input_file,
                 pending_identifier_deletions,
                 history=identifier_no_match_history,
                 history_keys=identifier_no_match_keys,
-                history_path=identifier_no_match_file,
                 persist=persist_no_match,
                 identifier_deleter=identifier_deleter,
-                write_json=settings.write_json,
             )
             print(
-                f"Deleted {deleted_cells} EAN/UPC cells after two "
+                f"Deleted {deleted_cells} EAN/UPC codes after two "
                 "consecutive no-match results"
             )
         except Exception as error:
             print(f"Error deleting repeated no-match identifiers: {error}")
             exit_code = 1
     elif pending_identifier_deletions:
-        print("Not deleting EAN/UPC cells because the scrape stopped on an error")
-
-    if settings.write_json:
-        try:
-            write_winners_json(winners, json_output_file)
-            print(f"Live JSON feed saved to {json_output_file}")
-        except Exception as error:
-            print(f"Error saving live JSON feed: {error}")
-            exit_code = 1
-
-    saved_path = output_file
-    if settings.write_xlsx:
-        try:
-            saved_path = write_winners_xlsx(winners, output_file)
-        except Exception as error:
-            print(f"Error saving winning listings: {error}")
-            return 1
+        print("Not deleting EAN/UPC codes because the scrape stopped on an error")
 
     print(f"Found {len(winners)} winning listings")
     if skipped_previous_winners:
@@ -1892,20 +1391,5 @@ def main(settings: ScrapeSettings | None = None) -> int:
             f"Skipped {skipped_previous_winners} previously won "
             "or duplicate listings"
         )
-    if settings.write_xlsx:
-        if saved_path != output_file:
-            print(
-                f"Could not overwrite {output_file.name} (file may be open); "
-                f"saved to {saved_path.name}"
-            )
-        else:
-            print(f"Saved to {saved_path}")
-    elif store is not None:
-        print("Winning listings saved to SQLite")
     return exit_code
-
-
-if __name__ == "__main__":
-    print("Edit SETTINGS in ebay/main.py, then run that file.")
-    raise SystemExit(0)
 

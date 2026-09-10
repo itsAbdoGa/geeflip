@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% set active_page = 'feed' %}
+{% block title %}GEEFLIP V2 — Scrape desk{% endblock %}
+
+{% block body %}
+<div class="desk">
+  <aside class="panel filters">
+    <div class="panel-head">
+      <h2>Filters</h2>
+      <button type="button" class="text-btn" id="preview-btn">Preview</button>
+    </div>
+    <p class="hint" id="preview-line">Saved automatically when you start a scrape.</p>
+    <form id="filters-form">
+      <fieldset>
+        <legend>Row range</legend>
+        <label>Start row <input type="number" name="start_row" min="2" placeholder="first"></label>
+        <label>End row <input type="number" name="end_row" min="2" placeholder="last"></label>
+        <label>Limit <input type="number" name="limit" min="1" placeholder="no cap"></label>
+      </fieldset>
+      <fieldset>
+        <legend>Brands</legend>
+        <label>Include <input type="text" name="include_brands" placeholder="LEGO, Hasbro"></label>
+        <label>Exclude <input type="text" name="exclude_brands" placeholder="comma separated"></label>
+      </fieldset>
+      <fieldset>
+        <legend>Win criteria</legend>
+        <label>Min ROI % <input type="number" name="min_roi_percent" step="0.1"></label>
+        <label>Max ROI % <input type="number" name="max_roi_percent" step="0.1"></label>
+        <label>Max listing age (days) <input type="number" name="max_listing_age_days" min="0"></label>
+        <label>Min seller reviews <input type="number" name="min_seller_reviews" min="0"></label>
+      </fieldset>
+      <fieldset>
+        <legend>Catalog cuts</legend>
+        <label>Min sales rank <input type="number" name="min_sales_rank" min="0" placeholder="none"></label>
+        <label>Max sales rank <input type="number" name="max_sales_rank" min="0"></label>
+        <label>Min buy box $ <input type="number" name="min_buybox_price" min="0" step="0.01"></label>
+        <label>Min 90-day drops <input type="number" name="min_drop_count" min="0" placeholder="none"></label>
+      </fieldset>
+      <fieldset>
+        <legend>Search modes</legend>
+        <label class="check"><input type="checkbox" name="upc_as_well"> Search UPC as well as EAN</label>
+        <label class="check"><input type="checkbox" name="cleaned_title_as_well"> Also search cleaned title</label>
+        <label class="check"><input type="checkbox" name="titles_only"> Cleaned-title searches only</label>
+        <label class="check"><input type="checkbox" name="image_search"> Image search from listing photo</label>
+        <label class="check"><input type="checkbox" name="skip_previously_won"> Skip previously won listings</label>
+      </fieldset>
+      <fieldset>
+        <legend>Retention</legend>
+        <label>Winner history (days) <input type="number" name="winner_history_retention_days" min="1"></label>
+        <label>No-match skip (days) <input type="number" name="identifier_no_match_retention_days" min="1"></label>
+      </fieldset>
+    </form>
+  </aside>
+
+  <main class="stage">
+    <section class="controls">
+      <div class="stats">
+        <div class="stat"><span>Catalog</span><strong id="stat-products">{{ '{:,}'.format(stats.products) }}</strong></div>
+        <div class="stat"><span>This run</span><strong id="stat-run">0</strong></div>
+        <div class="stat"><span>Winners</span><strong id="stat-winners">{{ '{:,}'.format(stats.winners) }}</strong></div>
+        <div class="stat"><span>Worked</span><strong id="stat-worked">{{ '{:,}'.format(stats.worked) }}</strong></div>
+        <div class="stat good"><span>Matched</span><strong id="stat-matched">{{ '{:,}'.format(stats.matched) }}</strong></div>
+        <div class="stat bad"><span>Mismatched</span><strong id="stat-mismatched">{{ '{:,}'.format(stats.mismatched) }}</strong></div>
+      </div>
+      <div class="switches">
+        <button type="button" class="go" id="start-btn">Start scraping</button>
+        <button type="button" class="halt" id="stop-btn" disabled>Stop</button>
+      </div>
+    </section>
+
+    <section class="panel terminal-wrap">
+      <div class="panel-head">
+        <h2>Console</h2>
+        <div class="head-actions">
+          <label class="check tiny"><input type="checkbox" id="autoscroll" checked> Follow</label>
+          <button type="button" class="text-btn" id="clear-logs">Clear</button>
+        </div>
+      </div>
+      <pre class="terminal" id="terminal" aria-live="polite" aria-label="Scraper log"></pre>
+    </section>
+
+    <section class="panel feed-wrap">
+      <div class="panel-head">
+        <h2>Winning listings</h2>
+        <div class="head-actions">
+          <input type="search" id="feed-search" placeholder="Search ASIN, title, seller" autocomplete="off">
+          <select id="feed-review">
+            <option value="all">All</option>
+            <option value="unseen">Unseen</option>
+            <option value="seen">Seen</option>
+            <option value="unreviewed">No verdict</option>
+            <option value="matched">Matched</option>
+            <option value="mismatched">Mismatched</option>
+          </select>
+          <label class="check tiny"><input type="checkbox" id="feed-this-run"> This run only</label>
+        </div>
+      </div>
+      <p class="hint" id="feed-count">Loading…</p>
+      <div class="feed" id="feed"></div>
+      <div class="pager">
+        <button type="button" class="text-btn" id="feed-prev" disabled>Previous</button>
+        <span id="feed-page">—</span>
+        <button type="button" class="text-btn" id="feed-next" disabled>Next</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<template id="winner-card">
+  <article class="card">
+    <div class="card-photos">
+      <figure><img class="photo-ebay" alt="eBay listing photo" loading="lazy"><figcaption>eBay</figcaption></figure>
+      <figure><img class="photo-amazon" alt="Amazon product photo" loading="lazy"><figcaption>Amazon</figcaption></figure>
+    </div>
+    <div class="card-body">
+      <h3 class="card-title"></h3>
+      <p class="card-sub"></p>
+      <dl class="card-figures">
+        <div><dt>ROI</dt><dd class="fig-roi"></dd></div>
+        <div><dt>Buy box</dt><dd class="fig-buybox"></dd></div>
+        <div><dt>eBay cost</dt><dd class="fig-cost"></dd></div>
+        <div><dt>Seller</dt><dd class="fig-seller"></dd></div>
+        <div><dt>Listed</dt><dd class="fig-listed"></dd></div>
+        <div><dt>Found</dt><dd class="fig-found"></dd></div>
+      </dl>
+      <div class="card-links">
+        <a class="link-ebay" target="_blank" rel="noreferrer noopener">Open eBay listing</a>
+        <a class="link-amazon" target="_blank" rel="noreferrer noopener">Open Amazon</a>
+      </div>
+    </div>
+    <div class="card-actions">
+      <button type="button" class="mark seen" data-action="seen">Seen</button>
+      <button type="button" class="mark matched" data-action="matched">Matched</button>
+      <button type="button" class="mark mismatched" data-action="mismatched">Mismatched</button>
+    </div>
+  </article>
+</template>
+{% endblock %}
+
+{% block scripts %}
+<script>window.GEEFLIP_FILTERS = {{ filters | tojson }};</script>
+<script src="{{ url_for('static', filename='js/feed.js') }}"></script>
+{% endblock %}

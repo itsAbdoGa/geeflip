@@ -1,81 +1,165 @@
-const PAGE_SIZE = 50;
-let offset = 0;
-let query = "";
-let total = 0;
+(() => {
+  const form = document.getElementById('browse-form');
+  const body = document.getElementById('asins-body');
+  const countLabel = document.getElementById('asins-count');
+  const pageLabel = document.getElementById('asins-page');
+  const prevBtn = document.getElementById('asins-prev');
+  const nextBtn = document.getElementById('asins-next');
 
-const form = document.getElementById("asins-search");
-const body = document.getElementById("asins-body");
-const count = document.getElementById("asins-count");
-const pageLabel = document.getElementById("asins-page");
+  let offset = 0;
+  let total = 0;
 
-function money(value) {
-  return formatMoney(value);
-}
+  const pageSize = () => Number(form.elements.limit.value) || 50;
 
-function render(payload) {
-  total = payload.total || 0;
-  const rows = payload.asins || [];
-  count.textContent = `${total.toLocaleString()} ASINs in SQLite`;
-  if (!rows.length) {
-    body.innerHTML = `<tr class="empty"><td colspan="9">No matching ASINs.</td></tr>`;
-  } else {
-    body.innerHTML = rows
-      .map((row) => {
-        const link = row.amazon_url
-          ? `<a href="${escapeAttr(row.amazon_url)}" target="_blank" rel="noreferrer">Amazon</a>`
-          : "—";
-        const photo = row.amazon_image_url
-          ? `<a class="thumb-sm" href="${escapeAttr(row.amazon_url || row.amazon_image_url)}" target="_blank" rel="noreferrer"><img src="${escapeAttr(row.amazon_image_url)}" alt="" referrerpolicy="no-referrer"></a>`
-          : `<div class="thumb-sm"></div>`;
-        const mismatches = Number(row.mismatch_count || 0);
-        return `<tr>
-          <td>${photo}</td>
-          <td>${escapeHtml(row.source_row ?? "")}</td>
-          <td class="mono">${escapeHtml(row.asin || "")}</td>
-          <td class="title">${escapeHtml(row.title || "")}</td>
-          <td>${escapeHtml(row.brand || "")}</td>
-          <td>${escapeHtml(money(row.buybox_price))}</td>
-          <td>${row.sales_rank == null ? "—" : Number(row.sales_rank).toLocaleString()}</td>
-          <td>${mismatches}</td>
-          <td>${link}</td>
-        </tr>`;
-      })
-      .join("");
+  function readFilters() {
+    return {
+      q: form.elements.q.value.trim(),
+      brand: form.elements.brand.value,
+      activity: form.elements.activity.value,
+      sort: form.elements.sort.value,
+      min_rank: form.elements.min_rank.value,
+      max_rank: form.elements.max_rank.value,
+      min_buybox: form.elements.min_buybox.value,
+      max_buybox: form.elements.max_buybox.value,
+      limit: pageSize(),
+      offset,
+    };
   }
-  const start = total === 0 ? 0 : offset + 1;
-  const end = offset + rows.length;
-  pageLabel.textContent = `${start.toLocaleString()}–${end.toLocaleString()} of ${total.toLocaleString()}`;
-  document.getElementById("asins-prev").disabled = offset <= 0;
-  document.getElementById("asins-next").disabled = offset + PAGE_SIZE >= total;
-}
 
-async function load() {
-  const params = new URLSearchParams({
-    q: query,
-    offset: String(offset),
-    limit: String(PAGE_SIZE),
+  function cell(text, className) {
+    const td = document.createElement('td');
+    if (className) td.className = className;
+    td.textContent = text;
+    return td;
+  }
+
+  function tally(value, tone) {
+    const number = Number(value) || 0;
+    const td = document.createElement('td');
+    td.className = `num ${number === 0 ? 'tally-none' : tone || ''}`.trim();
+    td.textContent = number ? number.toLocaleString() : '0';
+    return td;
+  }
+
+  function linkCell(asin) {
+    const td = document.createElement('td');
+    if (asin.amazon_url) td.appendChild(anchor(asin.amazon_url, 'Amazon'));
+    if (asin.ebay_search_url) {
+      if (td.childElementCount) td.append(' · ');
+      td.appendChild(anchor(asin.ebay_search_url, 'eBay'));
+    }
+    if (!td.childElementCount) td.textContent = '—';
+    return td;
+  }
+
+  function anchor(href, text) {
+    const link = document.createElement('a');
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noreferrer noopener';
+    link.textContent = text;
+    return link;
+  }
+
+  function photoCell(url, title) {
+    const td = document.createElement('td');
+    if (!url) {
+      td.textContent = '—';
+      return td;
+    }
+    const image = document.createElement('img');
+    image.className = 'thumb';
+    image.src = url;
+    image.alt = title || '';
+    image.loading = 'lazy';
+    image.onerror = () => image.replaceWith(document.createTextNode('—'));
+    td.appendChild(image);
+    return td;
+  }
+
+  function render(payload) {
+    total = payload.total;
+    body.replaceChildren();
+
+    if (!payload.asins.length) {
+      const row = document.createElement('tr');
+      row.className = 'empty';
+      const td = document.createElement('td');
+      td.colSpan = 15;
+      td.textContent = 'No ASINs match these filters.';
+      row.appendChild(td);
+      body.appendChild(row);
+    }
+
+    payload.asins.forEach((asin) => {
+      const row = document.createElement('tr');
+      row.append(
+        photoCell(asin.amazon_image_url, asin.title),
+        cell(asin.source_row, 'num'),
+        // How many catalog rows collapsed into this ASIN.
+        cell(asin.catalog_rows > 1 ? asin.catalog_rows : '—', 'num'),
+        cell(asin.asin || '—', 'mono'),
+        cell(asin.title || '—', 'title'),
+        cell(asin.brand || '—'),
+        cell(asin.buybox_price === null ? '—' : GEEFLIP.money(asin.buybox_price), 'num'),
+        cell(asin.sales_rank === null ? '—' : GEEFLIP.count(asin.sales_rank), 'num'),
+        cell(asin.drops_count === null ? '—' : GEEFLIP.count(asin.drops_count), 'num'),
+        tally(asin.winners_count),
+        tally(asin.worked_count),
+        tally(asin.matched_count, 'tally-good'),
+        tally(asin.mismatched_count, 'tally-bad'),
+        cell(asin.last_won_at ? GEEFLIP.shortDate(asin.last_won_at) : '—'),
+        linkCell(asin)
+      );
+      body.appendChild(row);
+    });
+
+    const size = pageSize();
+    countLabel.textContent = `${GEEFLIP.count(total)} ASIN${total === 1 ? '' : 's'}`;
+    const from = total ? offset + 1 : 0;
+    pageLabel.textContent = total
+      ? `${from}–${Math.min(offset + size, total)} of ${GEEFLIP.count(total)}`
+      : '—';
+    prevBtn.disabled = offset === 0;
+    nextBtn.disabled = offset + size >= total;
+  }
+
+  async function load() {
+    try {
+      render(await GEEFLIP.get(`/api/asins?${GEEFLIP.query(readFilters())}`));
+    } catch (error) {
+      GEEFLIP.toast(`Could not load ASINs: ${error.message}`);
+    }
+  }
+
+  const reload = () => {
+    offset = 0;
+    load();
+  };
+
+  form.addEventListener('submit', (event) => event.preventDefault());
+  form.addEventListener('change', reload);
+  form.elements.q.addEventListener('input', GEEFLIP.debounce(reload, 350));
+  form.elements.min_rank.addEventListener('input', GEEFLIP.debounce(reload, 450));
+  form.elements.max_rank.addEventListener('input', GEEFLIP.debounce(reload, 450));
+  form.elements.min_buybox.addEventListener('input', GEEFLIP.debounce(reload, 450));
+  form.elements.max_buybox.addEventListener('input', GEEFLIP.debounce(reload, 450));
+
+  document.getElementById('reset-filters').addEventListener('click', () => {
+    form.reset();
+    reload();
   });
-  const payload = await fetchJson(`/api/asins?${params.toString()}`);
-  render(payload);
-}
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  query = new FormData(form).get("q") || "";
-  offset = 0;
-  await load();
-});
+  prevBtn.addEventListener('click', () => {
+    offset = Math.max(0, offset - pageSize());
+    load();
+  });
+  nextBtn.addEventListener('click', () => {
+    if (offset + pageSize() < total) {
+      offset += pageSize();
+      load();
+    }
+  });
 
-document.getElementById("asins-prev").addEventListener("click", async () => {
-  offset = Math.max(0, offset - PAGE_SIZE);
-  await load();
-});
-
-document.getElementById("asins-next").addEventListener("click", async () => {
-  offset += PAGE_SIZE;
-  await load();
-});
-
-load().catch((error) => {
-  count.textContent = error.message;
-});
+  load();
+})();

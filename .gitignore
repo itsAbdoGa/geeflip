@@ -10,9 +10,6 @@ ebay/data/input/requests_cookies.json
 # Captured page dumps from scrape errors
 ebay/data/input/ebay_source.html
 
-# Browser profiles hold cookies/session data
-**/data/browser/
-
 # GEEFLIP local database
 geeflip/data/*.db
 geeflip/data/*.db-*

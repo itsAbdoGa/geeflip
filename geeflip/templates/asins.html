@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% set active_page = 'asins' %}
+{% block title %}GEEFLIP V2 — ASIN database{% endblock %}
+
+{% block body %}
+<main class="stage wide">
+  <section class="controls">
+    <div class="stats">
+      <div class="stat"><span>ASINs</span><strong>{{ '{:,}'.format(stats.asins) }}</strong></div>
+      <div class="stat"><span>Catalog rows</span><strong>{{ '{:,}'.format(stats.products) }}</strong></div>
+      <div class="stat"><span>Brands</span><strong>{{ '{:,}'.format(stats.brands) }}</strong></div>
+      <div class="stat"><span>With photos</span><strong>{{ '{:,}'.format(stats.with_image) }}</strong></div>
+      <div class="stat"><span>Have won</span><strong>{{ '{:,}'.format(stats.winning_asins) }}</strong></div>
+      <div class="stat good"><span>Matched</span><strong>{{ '{:,}'.format(stats.matched) }}</strong></div>
+      <div class="stat bad"><span>Mismatched</span><strong>{{ '{:,}'.format(stats.mismatched) }}</strong></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Browse</h2>
+      <button type="button" class="text-btn" id="reset-filters">Reset</button>
+    </div>
+    <form class="browse" id="browse-form">
+      <label class="grow">Search
+        <input type="search" name="q" placeholder="ASIN, title, brand, EAN or UPC" autocomplete="off">
+      </label>
+      <label>Brand
+        <select name="brand">
+          <option value="">All brands</option>
+          {% for brand in brands %}<option value="{{ brand }}">{{ brand }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Activity
+        <select name="activity">
+          <option value="all">Everything</option>
+          <option value="winners">Has winning listings</option>
+          <option value="none">Never won</option>
+          <option value="worked">Has worked listings</option>
+          <option value="unworked">Won but not worked</option>
+          <option value="matched">Has matches</option>
+          <option value="mismatched">Has mismatches</option>
+        </select>
+      </label>
+      <label>Sort by
+        <select name="sort">
+          <option value="row">Catalog row</option>
+          <option value="winners">Most winning listings</option>
+          <option value="worked">Most worked</option>
+          <option value="matched">Most matched</option>
+          <option value="mismatched">Most mismatched</option>
+          <option value="recent">Most recently won</option>
+          <option value="rank">Best sales rank</option>
+          <option value="buybox">Highest buy box</option>
+          <option value="title">Title A–Z</option>
+        </select>
+      </label>
+      <label>Sales rank
+        <span class="range">
+          <input type="number" name="min_rank" min="0" placeholder="min">
+          <input type="number" name="max_rank" min="0" placeholder="max">
+        </span>
+      </label>
+      <label>Buy box $
+        <span class="range">
+          <input type="number" name="min_buybox" min="0" step="0.01" placeholder="min">
+          <input type="number" name="max_buybox" min="0" step="0.01" placeholder="max">
+        </span>
+      </label>
+      <label>Per page
+        <select name="limit">
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+      </label>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>ASINs</h2>
+      <span class="hint" id="asins-count">Loading…</span>
+    </div>
+    <div class="table-scroll">
+      <table class="grid">
+        <thead>
+          <tr>
+            <th>Photo</th>
+            <th class="num">Row</th>
+            <th class="num">Rows</th>
+            <th>ASIN</th>
+            <th>Title</th>
+            <th>Brand</th>
+            <th class="num">Buy box</th>
+            <th class="num">Sales rank</th>
+            <th class="num">Drops</th>
+            <th class="num">Winners</th>
+            <th class="num">Worked</th>
+            <th class="num">Matched</th>
+            <th class="num">Mismatched</th>
+            <th>Last won</th>
+            <th>Links</th>
+          </tr>
+        </thead>
+        <tbody id="asins-body">
+          <tr class="empty"><td colspan="15">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <button type="button" class="text-btn" id="asins-prev" disabled>Previous</button>
+      <span id="asins-page">—</span>
+      <button type="button" class="text-btn" id="asins-next" disabled>Next</button>
+    </div>
+  </section>
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/asins.js') }}"></script>
+{% endblock %}
