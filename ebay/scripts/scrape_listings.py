@@ -1,7 +1,7 @@
 import re
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from lib.ebay_scraper import (
-    BROWSER_RESTART_EVERY,
+    BrowserOptions,
     EbayShipToNotUsError,
     browser_session,
     describe_ebay_cookie_session,
@@ -64,7 +64,7 @@ class ScrapeSettings:
     cookies_file: Path | None = EBAY_COOKIES_FILE
     cookie_header: str | None = None
 
-    headless: bool = True
+    browser: BrowserOptions = field(default_factory=BrowserOptions)
     should_stop: Callable[[], bool] | None = None
     store: object | None = None
 
@@ -1284,12 +1284,12 @@ def main(settings: ScrapeSettings | None = None) -> int:
             cookies_file=settings.cookies_file,
             default_cookies_file=EBAY_COOKIES_FILE,
         )
-        mode_label = "headless" if settings.headless else "headed"
-        print(f"Scraping {total} eBay search URLs with Playwright ({mode_label})")
+        browser_options = settings.browser
+        restart_every = max(0, int(browser_options.restart_every))
+        print(f"Scraping {total} eBay search URLs with Playwright")
+        print(f"Browser: {browser_options.describe()}")
         print(f"eBay session: {describe_ebay_cookie_session(cookies)}")
-        if BROWSER_RESTART_EVERY:
-            print(f"Restarting browser every {BROWSER_RESTART_EVERY} searches")
-        with browser_session(cookies=cookies, headless=settings.headless) as session:
+        with browser_session(cookies=cookies, options=browser_options) as session:
             skipped_previous_ean_for_ship_to = False
             searches_since_browser_start = 0
             for index, product in enumerate(products, start=1):
@@ -1297,10 +1297,7 @@ def main(settings: ScrapeSettings | None = None) -> int:
                     stop_reason = "stopped from website"
                     break
                 current_product = product
-                if (
-                    BROWSER_RESTART_EVERY
-                    and searches_since_browser_start >= BROWSER_RESTART_EVERY
-                ):
+                if restart_every and searches_since_browser_start >= restart_every:
                     print(
                         f"Restarting browser after {index - 1} searches "
                         "to free memory"

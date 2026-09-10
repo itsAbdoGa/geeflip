@@ -13,6 +13,7 @@ for entry in (str(PACKAGE_ROOT), str(EBAY_ROOT)):
 
 from scripts.scrape_listings import ScrapeSettings
 
+from browser import build_options, load_browser
 from paths import COOKIE_FILE
 
 DEFAULT_FILTERS: dict = {
@@ -125,7 +126,7 @@ def build_settings(filters: dict, store, *, should_stop=None) -> ScrapeSettings:
         winner_history_retention_days=data["winner_history_retention_days"],
         identifier_no_match_retention_days=data["identifier_no_match_retention_days"],
         cookies_file=COOKIE_FILE,
-        headless=True,
+        browser=build_options(load_browser(store)),
         should_stop=should_stop,
         store=store,
     )

@@ -203,19 +203,28 @@ class Store:
             )
             self._conn.commit()
 
-    def load_filters(self, defaults: dict) -> dict:
-        raw = self.get_setting("filters")
+    def load_json(self, key: str, defaults: dict) -> dict:
+        """Read a saved settings blob, falling back to defaults key by key."""
+        raw = self.get_setting(key)
         merged = dict(defaults)
         if raw:
             try:
-                merged.update(json.loads(raw))
+                stored = json.loads(raw)
             except json.JSONDecodeError:
                 return dict(defaults)
+            if isinstance(stored, dict):
+                merged.update(stored)
         return merged
 
+    def save_json(self, key: str, value: dict) -> dict:
+        self.set_setting(key, json.dumps(value))
+        return value
+
+    def load_filters(self, defaults: dict) -> dict:
+        return self.load_json("filters", defaults)
+
     def save_filters(self, filters: dict) -> dict:
-        self.set_setting("filters", json.dumps(filters))
-        return filters
+        return self.save_json("filters", filters)
 
     # ------------------------------------------------------------------
     # scraper contract — these names are looked up by scrape_listings.main

@@ -36,6 +36,25 @@ BROWSER_ARGS = [
 ]
 BROWSER_RESTART_EVERY = 1000
 BROWSER_RESTART_PAUSE_SECONDS = 1.5
+
+# Chromium eats memory on long runs, so these flags trade rendering fidelity for
+# a lighter footprint. They are only added when the matching option is on.
+LOW_MEMORY_ARGS = [
+    "--renderer-process-limit=1",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-features=TranslateUI,MediaRouter",
+    "--mute-audio",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
+BLOCKABLE_RESOURCES = {
+    "images": ("image", "media"),
+    "fonts": ("font",),
+    "styles": ("stylesheet",),
+}
 CHALLENGE_WAIT_TIMEOUT_MS = 8_000
 DOM_PRINT_CHARS = 4_000
 _PLAYWRIGHT_CHROMIUM_LOCK = threading.Lock()
@@ -1644,13 +1663,100 @@ def goto_ebay(page: Page, url: str, *, wait_until: str = "domcontentloaded"):
     raise last_error
 
 
-def create_browser_context(browser: Browser, *, cookies: list[dict] | None = None):
+@dataclass
+class BrowserOptions:
+    """How hard Chromium is allowed to work. Tuned from the website's admin page."""
+
+    headless: bool = True
+    use_installed_chrome: bool = True
+    window_width: int = 1440
+    window_height: int = 900
+    disable_gpu: bool = False
+    low_memory: bool = False
+    block_images: bool = False
+    block_fonts: bool = False
+    block_styles: bool = False
+    restart_every: int = BROWSER_RESTART_EVERY
+    restart_pause_seconds: float = BROWSER_RESTART_PAUSE_SECONDS
+    page_timeout_ms: int = PAGE_TIMEOUT_MS
+    results_timeout_ms: int = RESULTS_SELECTOR_TIMEOUT_MS
+    extra_args: tuple[str, ...] = ()
+
+    def launch_args(self) -> list[str]:
+        args = list(BROWSER_ARGS)
+        args.append(f"--window-size={self.window_width},{self.window_height}")
+        if self.disable_gpu:
+            args += ["--disable-gpu", "--disable-software-rasterizer"]
+        if self.low_memory:
+            args += LOW_MEMORY_ARGS
+        args += [arg for arg in self.extra_args if arg]
+        # Preserve order but drop duplicates so repeated flags cannot conflict.
+        return list(dict.fromkeys(args))
+
+    def blocked_resource_types(self) -> set[str]:
+        blocked: set[str] = set()
+        if self.block_images:
+            blocked.update(BLOCKABLE_RESOURCES["images"])
+        if self.block_fonts:
+            blocked.update(BLOCKABLE_RESOURCES["fonts"])
+        if self.block_styles:
+            blocked.update(BLOCKABLE_RESOURCES["styles"])
+        return blocked
+
+    def describe(self) -> str:
+        bits = ["headless" if self.headless else "headed"]
+        bits.append("chrome" if self.use_installed_chrome else "bundled chromium")
+        bits.append(f"{self.window_width}x{self.window_height}")
+        if self.disable_gpu:
+            bits.append("no gpu")
+        if self.low_memory:
+            bits.append("low memory")
+        blocked = sorted(self.blocked_resource_types())
+        if blocked:
+            bits.append(f"blocking {', '.join(blocked)}")
+        bits.append(f"restart every {self.restart_every}")
+        return ", ".join(bits)
+
+
+def apply_timeout_options(options: BrowserOptions) -> None:
+    """Push the tunable timeouts into the module globals the scraper reads.
+
+    Only one scrape runs at a time, so a module-level switch is simpler than
+    threading two numbers through every navigation helper in this file.
+    """
+    global PAGE_TIMEOUT_MS, RESULTS_SELECTOR_TIMEOUT_MS
+    PAGE_TIMEOUT_MS = max(1_000, int(options.page_timeout_ms))
+    RESULTS_SELECTOR_TIMEOUT_MS = max(500, int(options.results_timeout_ms))
+
+
+def block_heavy_resources(context, options: BrowserOptions) -> None:
+    blocked = options.blocked_resource_types()
+    if not blocked:
+        return
+
+    def handle(route):
+        if route.request.resource_type in blocked:
+            route.abort()
+        else:
+            route.continue_()
+
+    context.route("**/*", handle)
+
+
+def create_browser_context(
+    browser: Browser,
+    *,
+    cookies: list[dict] | None = None,
+    options: BrowserOptions | None = None,
+):
+    options = options or BrowserOptions()
     context = browser.new_context(
         locale="en-US",
         timezone_id="America/New_York",
-        viewport={"width": 1440, "height": 900},
+        viewport={"width": options.window_width, "height": options.window_height},
     )
     context.add_init_script(STEALTH_INIT_SCRIPT)
+    block_heavy_resources(context, options)
     apply_cookies_to_context(context, cookies or [])
     return context
 
@@ -1764,13 +1870,28 @@ def ensure_playwright_chromium_installed() -> None:
         print(f"GEEFLIP: Chromium still unusable after install ({detail})", flush=True)
 
 
-def launch_ebay_browser(playwright, cookies: list[dict], *, headless: bool = False):
-    browser = playwright.chromium.launch(
-        headless=headless,
-        channel="chrome",
-        args=BROWSER_ARGS,
-    )
-    context = create_browser_context(browser, cookies=cookies)
+def launch_ebay_browser(
+    playwright,
+    cookies: list[dict],
+    *,
+    options: BrowserOptions | None = None,
+):
+    options = options or BrowserOptions()
+    apply_timeout_options(options)
+    kwargs = {"headless": options.headless, "args": options.launch_args()}
+    if options.use_installed_chrome:
+        kwargs["channel"] = "chrome"
+    try:
+        browser = playwright.chromium.launch(**kwargs)
+    except Exception as error:
+        if not options.use_installed_chrome:
+            raise
+        # Installed Chrome is missing on this machine; fall back to the copy
+        # Playwright downloaded rather than failing the whole scrape.
+        print(f"Installed Chrome unavailable ({type(error).__name__}); using bundled Chromium")
+        kwargs.pop("channel")
+        browser = playwright.chromium.launch(**kwargs)
+    context = create_browser_context(browser, cookies=cookies, options=options)
     page = context.new_page()
     warm_up_session(page)
     return browser, context, page
@@ -1790,10 +1911,16 @@ def close_ebay_browser(browser, context) -> None:
 
 
 class EbayBrowserSession:
-    def __init__(self, playwright, cookies: list[dict], *, headless: bool = False):
+    def __init__(
+        self,
+        playwright,
+        cookies: list[dict],
+        *,
+        options: BrowserOptions | None = None,
+    ):
         self._playwright = playwright
         self._cookies = cookies
-        self._headless = headless
+        self.options = options or BrowserOptions()
         self.browser = None
         self.context = None
         self.page = None
@@ -1803,7 +1930,7 @@ class EbayBrowserSession:
         self.browser, self.context, self.page = launch_ebay_browser(
             self._playwright,
             self._cookies,
-            headless=self._headless,
+            options=self.options,
         )
 
     def close(self) -> None:
@@ -1814,7 +1941,7 @@ class EbayBrowserSession:
 
     def restart(self) -> None:
         self.close()
-        time.sleep(BROWSER_RESTART_PAUSE_SECONDS)
+        time.sleep(max(0.0, float(self.options.restart_pause_seconds)))
         self.start()
 
 
@@ -1825,7 +1952,7 @@ def browser_session(
     cookie_header: str | None = None,
     cookies_file: Path | None = None,
     default_cookies_file: Path | None = None,
-    headless: bool = False,
+    options: BrowserOptions | None = None,
 ) -> Iterator[EbayBrowserSession]:
     if cookies is None:
         cookies = load_ebay_cookies(
@@ -1835,7 +1962,7 @@ def browser_session(
         )
 
     with sync_playwright() as playwright:
-        session = EbayBrowserSession(playwright, cookies, headless=headless)
+        session = EbayBrowserSession(playwright, cookies, options=options)
         try:
             yield session
         finally:
