@@ -31,7 +31,6 @@ DEFAULT_BROWSER: dict = {
     "low_memory": False,
     "block_images": False,
     "block_fonts": False,
-    "block_styles": False,
     "restart_every": 1000,
     "restart_pause_seconds": 1.5,
     "page_timeout_ms": 25_000,
@@ -74,13 +73,7 @@ PRESETS: dict[str, dict] = {
             "Shows a real Chrome window so you can see what the scraper sees. "
             "Heaviest option — use it to debug, not for long runs."
         ),
-        "values": {
-            **DEFAULT_BROWSER,
-            "headless": False,
-            "block_images": False,
-            "block_fonts": False,
-            "block_styles": False,
-        },
+        "values": {**DEFAULT_BROWSER, "headless": False},
     },
 }
 
@@ -91,7 +84,6 @@ _FLAGS = (
     "low_memory",
     "block_images",
     "block_fonts",
-    "block_styles",
 )
 # key -> (minimum, maximum)
 _INT_BOUNDS = {
@@ -136,12 +128,6 @@ def coerce_browser(payload: dict | None) -> dict:
     for key, (low, high) in _FLOAT_BOUNDS.items():
         data[key] = round(_clamp(data.get(key), low, high, DEFAULT_BROWSER[key]), 2)
     data["extra_args"] = _extra_args(data.get("extra_args"))
-
-    # Blocking stylesheets can hide the result cards entirely; only allow it
-    # when images are already blocked, which is the low-end case it belongs to.
-    if data["block_styles"] and not data["block_images"]:
-        data["block_styles"] = False
-
     return {key: data[key] for key in DEFAULT_BROWSER}
 
 
@@ -166,7 +152,6 @@ def build_options(settings: dict | None) -> BrowserOptions:
         low_memory=data["low_memory"],
         block_images=data["block_images"],
         block_fonts=data["block_fonts"],
-        block_styles=data["block_styles"],
         restart_every=data["restart_every"],
         restart_pause_seconds=data["restart_pause_seconds"],
         page_timeout_ms=data["page_timeout_ms"],

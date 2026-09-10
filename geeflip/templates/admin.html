@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% set active_page = 'admin' %}
+{% block title %}GEEFLIP V2 — Admin{% endblock %}
+
+{% block body %}
+<main class="stage admin">
+  <section class="panel">
+    <div class="panel-head">
+      <h2>eBay cookie</h2>
+      <span class="hint" id="cookie-state">
+        {% if cookie_status.present %}
+          {{ '{:,}'.format(cookie_status.characters) }} characters, {{ cookie_status.names | length }} values
+        {% else %}
+          No cookie saved
+        {% endif %}
+      </span>
+    </div>
+    <p class="hint">
+      Paste the whole <code>Cookie:</code> header from a signed-in eBay tab. Open eBay,
+      press F12, go to Network, click any request and copy the request header.
+      Without it eBay hides seller feedback counts and starts asking for a captcha.
+    </p>
+    <textarea id="cookie-box" class="code-box" rows="6" spellcheck="false"
+      placeholder="ebay=%5Esbf%3D%23000000%5E; dp1=...">{{ cookie }}</textarea>
+    <div class="row-actions">
+      <button type="button" class="go" id="cookie-save">Save cookie</button>
+      <button type="button" class="text-btn" id="cookie-clear">Clear</button>
+      <span class="hint" id="cookie-names">
+        {% if cookie_status.names %}{{ cookie_status.names | join(', ') }}{% endif %}
+      </span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Browser performance</h2>
+      <span class="hint" id="browser-summary">{{ browser_summary }}</span>
+    </div>
+    <p class="hint">
+      The scraper drives a real Chrome window, which is the heaviest part of a run.
+      Pick a preset if you are not sure, then fine-tune below. Changes apply to the
+      next scrape you start.
+    </p>
+
+    <div class="presets">
+      {% for key, preset in presets.items() %}
+      <button type="button" class="preset" data-preset="{{ key }}">
+        <strong>{{ preset.label }}</strong>
+        <span>{{ preset.hint }}</span>
+      </button>
+      {% endfor %}
+    </div>
+
+    <form id="browser-form">
+      <div class="admin-grid">
+        <fieldset>
+          <legend>Window</legend>
+          <label class="check"><input type="checkbox" name="headless"> Hide the browser window</label>
+          <p class="hint tiny">A hidden window skips all painting. Leave this on unless you want to watch the scrape.</p>
+          <label class="check"><input type="checkbox" name="use_installed_chrome"> Use the Chrome installed on this PC</label>
+          <p class="hint tiny">Turn off to use the Chromium that Playwright downloaded, if Chrome is missing or crashes.</p>
+          <label>Window width <input type="number" name="window_width" min="320" max="3840" step="10"></label>
+          <label>Window height <input type="number" name="window_height" min="240" max="2160" step="10"></label>
+          <p class="hint tiny">A smaller window means fewer pixels to lay out. 1024 × 720 is plenty for eBay results.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Rendering load</legend>
+          <label class="check"><input type="checkbox" name="disable_gpu"> Turn off GPU acceleration</label>
+          <p class="hint tiny">Helps on old laptops and integrated graphics where the GPU driver is the bottleneck.</p>
+          <label class="check"><input type="checkbox" name="low_memory"> Low-memory mode</label>
+          <p class="hint tiny">One renderer process, no background timers, no audio, no translate popups.</p>
+          <label class="check"><input type="checkbox" name="block_images"> Never download images</label>
+          <label class="check"><input type="checkbox" name="block_fonts"> Never download fonts</label>
+          <p class="hint tiny">
+            Blocking images is the single biggest saving and finds the same listings.
+            Photo links are still read from the page, but the image-search filter needs
+            the real pictures, so leave images on if you use it.
+          </p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Restarts</legend>
+          <label>Restart after N searches <input type="number" name="restart_every" min="0" max="100000" step="10"></label>
+          <p class="hint tiny">Chrome leaks memory over a long run. A low number (100–200) keeps a weak PC alive; 0 never restarts.</p>
+          <label>Pause after restart (seconds) <input type="number" name="restart_pause_seconds" min="0" max="60" step="0.5"></label>
+          <p class="hint tiny">Give a slow disk time to close the old window before opening a new one.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Patience</legend>
+          <label>Page load timeout (ms) <input type="number" name="page_timeout_ms" min="5000" max="180000" step="1000"></label>
+          <label>Results wait (ms) <input type="number" name="results_timeout_ms" min="500" max="60000" step="500"></label>
+          <p class="hint tiny">Raise both if a slow machine or slow connection makes searches come back empty.</p>
+          <label>Extra Chromium flags
+            <textarea name="extra_args" class="code-box" rows="3" spellcheck="false"
+              placeholder="--disable-extensions"></textarea>
+          </label>
+          <p class="hint tiny">One flag per line. Anything not starting with <code>--</code> is dropped.</p>
+        </fieldset>
+      </div>
+    </form>
+
+    <div class="row-actions">
+      <button type="button" class="go" id="browser-save">Save settings</button>
+      <button type="button" class="text-btn" id="browser-reset">Restore defaults</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Catalog</h2>
+      <span class="hint" id="catalog-state"></span>
+    </div>
+    <p class="hint">
+      Re-reads both Excel files in <code>clean/</code> and rebuilds the product table.
+      Your winning listings and their seen / matched marks are untouched.
+    </p>
+    <div class="row-actions">
+      <button type="button" class="text-btn" id="reimport">Reimport from Excel</button>
+    </div>
+  </section>
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  window.GEEFLIP_BROWSER = {{ browser | tojson }};
+  window.GEEFLIP_PRESETS = {{ presets | tojson }};
+</script>
+<script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+{% endblock %}

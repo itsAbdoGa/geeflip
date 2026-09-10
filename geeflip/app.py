@@ -18,6 +18,7 @@ for entry in (str(PACKAGE_ROOT), str(EBAY_ROOT), str(PROJECT_ROOT)):
 
 from flask import Flask, jsonify, render_template, request
 
+from browser import DEFAULT_BROWSER, PRESETS, describe, load_browser, save_browser
 from cookies import cookie_status, read_cookie, write_cookie
 from filters import DEFAULT_FILTERS, build_settings, coerce_filters
 from importer import ensure_ready, import_amazon_images, import_catalog
@@ -66,6 +67,19 @@ def page_feed():
 @app.get("/asins")
 def page_asins():
     return render_template("asins.html", stats=store.stats(), brands=store.brands())
+
+
+@app.get("/admin")
+def page_admin():
+    browser = load_browser(store)
+    return render_template(
+        "admin.html",
+        cookie=read_cookie(),
+        cookie_status=cookie_status(),
+        browser=browser,
+        browser_summary=describe(browser),
+        presets=PRESETS,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -221,6 +235,33 @@ def api_set_cookie():
         return jsonify({"error": "That does not look like a cookie header"}), 400
     write_cookie(cookie)
     return jsonify({**cookie_status(), "cookie": read_cookie()})
+
+
+@app.get("/api/browser")
+def api_get_browser():
+    browser = load_browser(store)
+    return jsonify({"browser": browser, "summary": describe(browser)})
+
+
+@app.put("/api/browser")
+def api_put_browser():
+    try:
+        browser = save_browser(store, request.get_json(silent=True) or {})
+    except (TypeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify(
+        {
+            "browser": browser,
+            "summary": describe(browser),
+            "restart_needed": runner.running,
+        }
+    )
+
+
+@app.post("/api/browser/reset")
+def api_reset_browser():
+    browser = save_browser(store, DEFAULT_BROWSER)
+    return jsonify({"browser": browser, "summary": describe(browser)})
 
 
 @app.post("/api/catalog/reimport")

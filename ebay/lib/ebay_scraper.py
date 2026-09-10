@@ -50,10 +50,11 @@ LOW_MEMORY_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
 ]
+# Stylesheets are deliberately absent: eBay's result cards fail the scraper's
+# visibility checks without CSS, so blocking them returns zero listings.
 BLOCKABLE_RESOURCES = {
     "images": ("image", "media"),
     "fonts": ("font",),
-    "styles": ("stylesheet",),
 }
 CHALLENGE_WAIT_TIMEOUT_MS = 8_000
 DOM_PRINT_CHARS = 4_000
@@ -1675,7 +1676,6 @@ class BrowserOptions:
     low_memory: bool = False
     block_images: bool = False
     block_fonts: bool = False
-    block_styles: bool = False
     restart_every: int = BROWSER_RESTART_EVERY
     restart_pause_seconds: float = BROWSER_RESTART_PAUSE_SECONDS
     page_timeout_ms: int = PAGE_TIMEOUT_MS
@@ -1699,8 +1699,6 @@ class BrowserOptions:
             blocked.update(BLOCKABLE_RESOURCES["images"])
         if self.block_fonts:
             blocked.update(BLOCKABLE_RESOURCES["fonts"])
-        if self.block_styles:
-            blocked.update(BLOCKABLE_RESOURCES["styles"])
         return blocked
 
     def describe(self) -> str:
